@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>local.sekitiri</string>
+    <key>CFBundleName</key>
+    <string>Sekitiri</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.png</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Sekitiri records your microphone during meetings so you can transcribe them later. Audio stays on this Mac.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Sekitiri records system audio (the other side of your meetings) so you can transcribe them later. Audio stays on this Mac.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Sekitiri uses your calendar to detect meetings and attach titles and attendees to your local notes.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Sekitiri reads your calendar to detect meetings, send reminders, and attach titles and attendees to local notes.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Sekitiri checks the active Chrome or Safari tab only to recognise a meeting link and offer a recording reminder. It never reads page contents.</string>
+</dict>
+</plist>

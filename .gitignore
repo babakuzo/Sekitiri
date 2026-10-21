@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+.local-validation/
+*.app/
+/default.metallib
+.env
+.env.*
+*.key
+*.pem

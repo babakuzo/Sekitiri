@@ -1,0 +1,29 @@
+{
+  "description": "Hand-authored synthetic bilingual meetings. Tests field-level factual extraction and provenance; not a representative human-accent or broad factuality benchmark.",
+  "fixtures": [
+    {
+      "id": "mixed-en-fr-decisions-tasks-negation",
+      "transcript": "**[0:00] Nadia:** The budget is 450 euros. We have decided to keep a single version of the proposal.\n**[0:12] Thomas:** Agreed. The delivery date is not decided. Please do not describe Friday as the delivery date.\n**[0:24] Nadia:** Je m'engage à envoyer la proposition révisée à Thomas avant le vendredi 23 octobre.\n**[0:38] Thomas:** I will review the figures before Monday 26 October.\n**[0:49] Emma:** Maybe we could buy a new heat mapping tool. This is only a suggestion; no purchase is approved.\n**[1:01] Nadia:** Nous avons décidé de garder le budget à 450 euros.\n**[1:12] Emma:** Who will ask the customer to confirm delivery? We have not assigned an owner or a deadline.\n**[1:23] Thomas:** Someone should investigate the supplier, but nobody has committed to that work.",
+      "decisions": [
+        {"id":"single-version","phrases":["single version","une seule version"],"source_quotes":["decided to keep a single version"]},
+        {"id":"budget","phrases":["450"],"source_quotes":["décidé de garder le budget à 450"]}
+      ],
+      "actions": [
+        {"id":"send-proposal","phrases":["send the revised proposal","send the proposal","envoyer la proposition"],"owner":"Nadia","due_phrases":["vendredi 23 octobre","Friday 23 October","Friday, October 23","23 octobre","23 October"],"source_quotes":["Je m'engage à envoyer"]},
+        {"id":"review-figures","phrases":["review the figures","vérifier les chiffres","examine the figures"],"owner":"Thomas","due_phrases":["Monday 26 October","26 October","lundi 26 octobre"],"source_quotes":["I will review the figures before Monday 26 October"]}
+      ],
+      "forbidden_decision_phrases":["purchase","buy a new","acheter","delivery date is Friday","livraison vendredi"],
+      "forbidden_action_phrases":["investigate the supplier","buy a new","purchase","ask the customer","confirm delivery"],
+      "required_open_question_phrases":[["delivery date","date de livraison"]]
+    },
+    {
+      "id": "mixed-en-fr-no-commitments",
+      "transcript": "**[0:00] Alice:** Nous discutons d'un lancement à Lyon. Aucune ville n'est encore choisie.\n**[0:15] Bruno:** Could someone prepare a launch plan? That is a question, not an assignment.\n**[0:28] Alice:** I cannot own the launch plan. We have no owner and no deadline.\n**[0:39] Bruno:** D'accord. Nous n'avons pris aucune décision et personne ne s'est engagé à une tâche.\n**[0:51] Alice:** Maybe next Tuesday would work, but that date is not confirmed.",
+      "decisions": [],
+      "actions": [],
+      "forbidden_decision_phrases":["launch in Lyon","lancement à Lyon","Tuesday","mardi"],
+      "forbidden_action_phrases":["prepare a launch plan","préparer un plan"],
+      "required_open_question_phrases":[["owner","responsable","deadline","échéance","date","launch","lancement"]]
+    }
+  ]
+}

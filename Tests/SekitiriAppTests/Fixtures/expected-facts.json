@@ -1,0 +1,26 @@
+{
+  "short-meeting": {
+    "decisions": ["Pilot starts with the Paris support team", "No launch date was decided"],
+    "owners": ["Leon", "Maya"],
+    "dates": ["18 September", "tomorrow"],
+    "actionItems": ["Leon prepares onboarding checklist", "Maya confirms five pilot participants"],
+    "risks": ["Legal approval may arrive after onboarding starts"],
+    "unsupportedClaims": ["The pilot launch date is confirmed", "Legal approval was received"]
+  },
+  "noisy-diarized-meeting": {
+    "decisions": ["Retry limit remains three", "Database migration was not approved"],
+    "owners": ["Speaker 0", "Speaker 1"],
+    "dates": ["Friday 22 September"],
+    "actionItems": ["Speaker 1 fixes the dashboard", "Speaker 0 asks operations for a failover test window"],
+    "risks": ["Duplicate alerts during failover"],
+    "unsupportedClaims": ["Speaker 1 has a named identity", "Database migration was approved"]
+  },
+  "representative-one-hour-meeting": {
+    "decisions": ["Beta includes customer import and audit export", "Bulk editing moves after beta", "7 October remains conditional"],
+    "owners": ["Eva", "Omar", "Priya"],
+    "dates": ["3 October", "4 October", "5 October", "6 October", "7 October"],
+    "actionItems": ["Eva updates release notes and onboarding copy", "Omar runs migration rehearsal", "Omar drafts escalation rota", "Priya approves or revises rota"],
+    "risks": ["Migration time for accounts over ten million rows", "Security sign-off is pending"],
+    "unsupportedClaims": ["Security has signed off", "7 October is a confirmed public launch", "Bulk editing is in beta"]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "description": "Replace the example with consented human recordings, including varied English/French accents, code-switching, overlap, names and numbers. Capture timing measurements while running the app; synthetic speech alone cannot validate accent accuracy.",
+  "fixtures": [
+    {
+      "id": "mixed-english-french-names-numbers",
+      "audio_file": "recordings/mixed.caf",
+      "transcript_file": "recordings/mixed/transcript.json",
+      "reference": "Bonjour Emma, le budget est de 450 euros. Can you send the updated proposal to Sekitiri before Tuesday? Oui, je m'en occupe pour le 18 octobre.",
+      "required_phrases": ["Emma", "450 euros", "Sekitiri", "18 octobre"],
+      "maximum_wer": 0.15,
+      "recording_seconds": 60,
+      "recognition_seconds": null,
+      "after_stop_seconds": null
+    }
+  ]
+}

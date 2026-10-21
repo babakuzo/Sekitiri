@@ -1,0 +1,187 @@
+import AVFoundation
+import FluidAudio
+import Foundation
+
+/// Parakeet TDT 0.6B v2/v3 via FluidAudio's Core ML port. v3 is multilingual;
+/// v2 remains the English-focused fallback. Models download once into
+/// FluidAudio's managed cache and all inference runs on-device afterwards.
+actor ParakeetEngine: WindowedTranscriptionEngine {
+    enum EngineError: Error, CustomStringConvertible {
+        case notPrepared
+        case unreadableAudio(URL, Error?)
+        case missingWordTimings
+
+        var description: String {
+            switch self {
+            case .notPrepared: return "parakeet engine used before prepare()"
+            case .unreadableAudio(let url, let e):
+                return "unreadable or empty audio \(url.lastPathComponent)"
+                    + (e.map { ": \($0)" } ?? "")
+            case .missingWordTimings:
+                return "Speech recognition returned text without the timings needed to join audio windows safely."
+            }
+        }
+    }
+
+    nonisolated let name: String
+    nonisolated let model: String
+    nonisolated let languageCode: String
+    private let version: AsrModelVersion
+    private let languageHint: Language?
+
+    private var manager: AsrManager?
+
+    init(version: AsrModelVersion = .v2, languageCode: String = "auto") {
+        self.version = version
+        self.languageCode = languageCode
+        let baseCode = languageCode.split(separator: "-").first.map(String.init) ?? languageCode
+        switch version {
+        case .v3:
+            self.languageHint = Language(rawValue: baseCode)
+        default:
+            self.languageHint = nil
+        }
+        switch version {
+        case .v2:
+            name = "parakeet"
+            model = "parakeet-tdt-0.6b-v2-coreml"
+        case .v3:
+            name = "parakeet-v3"
+            model = "parakeet-tdt-0.6b-v3-coreml"
+        default:
+            name = "parakeet"
+            model = "parakeet-tdt-0.6b-v2-coreml"
+        }
+    }
+
+    func prepare() async throws {
+        guard manager == nil else { return }
+        let models = try await AsrModels.downloadAndLoad(version: version)
+        // Long recordings must not fan out multiple decoder workers. v3's
+        // multilingual path also requires the no-mel context boundary fix.
+        let manager = AsrManager(config: ASRConfig(
+            parallelChunkConcurrency: 1,
+            melChunkContext: version != .v3
+        ))
+        try await manager.loadModels(models)
+        self.manager = manager
+    }
+
+    func transcribe(_ audio: URL) async throws -> [TranscriptSegment] {
+        guard let manager else { throw EngineError.notPrepared }
+
+        // A track with no frames (recorder died before its first buffer)
+        // makes AVFoundation raise an ObjC exception deep inside the
+        // resampler — uncatchable from Swift, so it takes the whole daemon
+        // down. Check readability up front instead.
+        do {
+            let probe = try AVAudioFile(forReading: audio)
+            guard probe.length > 0 else { throw EngineError.unreadableAudio(audio, nil) }
+        } catch let error as EngineError {
+            throw error
+        } catch {
+            throw EngineError.unreadableAudio(audio, error)
+        }
+
+        var state = try TdtDecoderState()
+        let result = try await manager.transcribe(audio, decoderState: &state, language: languageHint)
+        try Task.checkCancellation()
+
+        let words = buildWordTimings(from: result.tokenTimings ?? [])
+        guard !words.isEmpty else {
+            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty
+                ? []
+                : [TranscriptSegment(start: 0, end: result.duration, text: text)]
+        }
+        return Self.segments(from: words)
+    }
+
+    func release() async {
+        if let manager { await manager.cleanup() }
+        manager = nil
+    }
+
+    /// Recognize one bounded window from finalized recording segments, returning
+    /// times relative to the track. `retaining` assigns words to adjacent core
+    /// intervals by midpoint while the surrounding audio provides context.
+    func transcribeWindow(
+        sourceURLs: [URL], start: TimeInterval, duration: TimeInterval,
+        retaining: Range<TimeInterval>? = nil
+    ) async throws -> [TranscriptSegment] {
+        guard let manager else { throw EngineError.notPrepared }
+        var samples = try AudioWindowReader.read(sourceURLs: sourceURLs, start: start, duration: duration)
+        guard !samples.isEmpty else { return [] }
+        // A recording may stop immediately after a core boundary. Keep that
+        // genuine tail rather than failing FluidAudio's 300ms minimum input.
+        let minimumSamples = Int(AudioWindowReader.sampleRate * 0.3)
+        if samples.count < minimumSamples {
+            samples.append(contentsOf: repeatElement(0, count: minimumSamples - samples.count))
+        }
+        var state = try TdtDecoderState()
+        let result = try await manager.transcribe(samples, decoderState: &state, language: languageHint)
+        try Task.checkCancellation()
+        let words = buildWordTimings(from: result.tokenTimings ?? [])
+        if words.isEmpty {
+            guard result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw EngineError.missingWordTimings
+            }
+            return []
+        }
+        return Self.segments(from: Self.retainedWords(
+            words, offset: start, retaining: retaining ?? start..<(start + duration),
+            reading: start..<(start + duration)
+        ))
+    }
+
+    static func retainedWords(
+        _ words: [WordTiming], offset: TimeInterval, retaining: Range<TimeInterval>,
+        reading: Range<TimeInterval>? = nil
+    ) -> [WordTiming] {
+        words.compactMap { word in
+            var start = word.startTime + offset
+            var end = word.endTime + offset
+            guard start.isFinite, end.isFinite, end >= start else { return nil }
+            if let reading {
+                guard end > reading.lowerBound, start < reading.upperBound else { return nil }
+                start = max(start, reading.lowerBound)
+                end = min(end, reading.upperBound)
+            }
+            guard retaining.contains((start + end) / 2) else { return nil }
+            return WordTiming(word: word.word, startTime: start, endTime: end)
+        }
+    }
+
+    /// Group word timings into readable segments: break on sentence-ending
+    /// punctuation (parakeet v2 emits punctuation), a silence gap, or a hard
+    /// length cap so a run-on speaker still wraps.
+    private static func segments(from words: [WordTiming]) -> [TranscriptSegment] {
+        var out: [TranscriptSegment] = []
+        var current: [WordTiming] = []
+
+        func flush() {
+            guard let first = current.first, let last = current.last else { return }
+            out.append(TranscriptSegment(
+                start: first.startTime,
+                end: last.endTime,
+                text: current.map(\.word).joined(separator: " ")
+            ))
+            current = []
+        }
+
+        for word in words {
+            if let last = current.last, word.startTime - last.endTime > 1.0 {
+                flush()
+            }
+            current.append(word)
+            let endsSentence = word.word.hasSuffix(".")
+                || word.word.hasSuffix("?")
+                || word.word.hasSuffix("!")
+            if endsSentence || current.count >= 60 {
+                flush()
+            }
+        }
+        flush()
+        return out
+    }
+}
