@@ -171,9 +171,9 @@ struct SettingsView: View {
                     SettingsRow(label: "Recording safety timeout") {
                         Picker("", selection: $recordingSafetyTimeoutMinutes) {
                             Text("Off — I will stop manually").tag(0)
-                            Text("2 hours").tag(120)
-                            Text("3 hours").tag(180)
-                            Text("4 hours").tag(240)
+                            Text("5 minutes").tag(5)
+                            Text("10 minutes").tag(10)
+                            Text("15 minutes").tag(15)
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
@@ -228,6 +228,10 @@ struct SettingsView: View {
         }
         .background(SekitiriColor.canvas)
         .onAppear {
+            // Migrate the previous hour-based choices to the new, short safety limits.
+            if ![0, 5, 10, 15].contains(recordingSafetyTimeoutMinutes) {
+                recordingSafetyTimeoutMinutes = 15
+            }
             refreshInputDevices()
             loadSummaryPrompt()
             Task { await model.refreshLocalSummaryModelState() }
