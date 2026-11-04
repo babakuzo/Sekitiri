@@ -81,7 +81,9 @@ final class SystemAudioRecorder: @unchecked Sendable {
         destinationURL = url
         try cancellationToken?.checkCancellation()
 
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        // Record everything the meeting plays, but not Sekitiri's own audio.
+        let ownProcess = OwnAudioProcess.objectID().map { [$0] } ?? []
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: ownProcess)
         description.name = "quill system tap"
         description.isPrivate = true
         description.muteBehavior = .unmuted

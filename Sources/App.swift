@@ -1,10 +1,32 @@
 import AppKit
+import Combine
+import EventKit
 import SwiftUI
 
 struct RecordingSafetyPrompt: Identifiable {
     let id = UUID()
     let reason: String
     let detail: String
+}
+
+/// Presentation state of one capture track (microphone or system audio).
+enum CaptureTrackState: Equatable {
+    case off
+    case recording
+    case paused
+    case degraded(String)
+
+    var isDegraded: Bool {
+        if case .degraded = self { return true }
+        return false
+    }
+}
+
+/// How the single status line should be presented.
+enum AppStatusTone: Equatable {
+    case normal
+    case recording
+    case warning
 }
 
 // ============================================================================
@@ -24,8 +46,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var isSummarizing = false
     @Published var isPaused = false
     @Published var elapsed = "0:00"
-    @Published var latestTranscript = "No transcript yet."
-    @Published var status = "Ready"
+    /// The one user-facing status line. Set through `setStatus(_:tone:)`.
+    @Published private(set) var status = "Ready"
+    @Published private(set) var statusTone: AppStatusTone = .normal
     @Published var liveSegments: [TranscriptionCoordinator.LiveSegment] = []
     @Published var liveTranscriptionStatus = ""
     @Published var detectedCallPrompt: MeetingContext?
@@ -35,9 +58,39 @@ final class AppModel: ObservableObject {
     @Published var additionalNotes = ""
     @Published var additionalNotesSaveStatus = ""
     @Published var additionalNotesSaveError: String?
-    @Published var captureHealthStatus = "Checking microphone and system audio…"
     @Published var recordingSafetyPrompt: RecordingSafetyPrompt?
-    @Published var recordingSafetyStatus = ""
+    /// Set by the menu bar or other windows; ContentView consumes it.
+    @Published var requestedMeetingID: String?
+    @Published var requestedSection: String?
+    /// Moments marked during the current (or just finished) recording.
+    @Published private(set) var markedMoments: [MarkedMoment] = []
+    /// A short confirmation at the bottom of the window, optionally undoable.
+    @Published private(set) var toast: AppToast?
+    private var toastUndo: (() -> Void)?
+    private var toastDismissTask: Task<Void, Never>?
+    /// Start of the current (or just-finished) recording.
+    @Published private(set) var recordingStartedAt: Date?
+    @Published private(set) var microphoneTrack: CaptureTrackState = .off
+    @Published private(set) var systemAudioTrack: CaptureTrackState = .off
+    @Published private(set) var microphoneDeviceName: String?
+    /// True while either track has reported sound within the last moment.
+    @Published private(set) var isHearingAudio = false
+    /// No sound reached either track for 30 seconds while recording.
+    @Published private(set) var noSoundWarning = false
+    /// The microphone alone has been silent for two minutes while other
+    /// participants were still audible: likely the wrong or a muted input.
+    @Published private(set) var micSilenceWarning = false
+    /// When the stop-after-silence safety will stop the recording.
+    @Published private(set) var silenceStopDeadline: Date?
+    /// Post-recording processing: stage from coordinator status events,
+    /// fraction and time estimate from its progress reports.
+    @Published var transcriptionProgress: TranscriptionProgressInfo?
+    @Published private(set) var lastCompletedSessionDirectory: URL?
+    /// Bumped whenever meetings on disk change (transcript ready, deleted…).
+    @Published private(set) var archiveRevision = 0
+    /// A session whose summary should start when its meeting page opens.
+    @Published var pendingSummarySession: URL?
+    @Published private(set) var calendarAuthorization: EKAuthorizationStatus
     @Published private(set) var activeMeeting: MeetingContext?
     @Published private(set) var upcomingMeeting: MeetingContext?
     @Published private(set) var todaySchedule: [MeetingContext] = []
@@ -54,20 +107,19 @@ final class AppModel: ObservableObject {
     @Published private(set) var localSummaryModelState: LocalSummaryModelState = .notDownloaded
 
     private var session: RecordingSession?
-    private var lastCompletedSessionDirectory: URL?
     private var ticker: Timer?
     private let coordinator = TranscriptionCoordinator()
-    private var transcriptPollTimer: Timer?
-    private var lastTranscriptPath: String?
-    var hasSavedTranscript: Bool { lastTranscriptPath != nil }
     private let calendarService: CalendarService
     private var calendarTimer: Timer?
+    private var calendarAuthorizationObserver: AnyCancellable?
     /// Every start gets a token. A Stop pressed while setup is still in flight
     /// invalidates that token, so a delayed audio setup can never turn itself
     /// into a recording after the user has cancelled it.
     private var recordingStartGeneration = 0
     private var recordingMeeting: MeetingContext?
     private var lastAudioActivityAt: Date?
+    private var lastMicActivityAt: Date?
+    static let micSilenceWarningSeconds: TimeInterval = 120
     private var hasAudioActivity = false
     private var remindedMeetingIDs = Set<String>()
     private var promptedCallIDs = Set<String>()
@@ -81,19 +133,38 @@ final class AppModel: ObservableObject {
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var liveTranscriptionSuspendedForResources = false
 
+    static let noSoundWarningSeconds: TimeInterval = 30
+    static let silenceStopWarningSeconds: TimeInterval = 60
+
     init() {
-        let savedSummaryModel = UserDefaults.standard.string(forKey: "summaryModel")
+        let defaults = UserDefaults.standard
+        // `autoRecord` is written on every launch below, so its absence marks
+        // the very first launch of any Sekitiri build.
+        let isFirstLaunch = defaults.object(forKey: "autoRecord") == nil
+        if isFirstLaunch {
+            // New installs opt in to browser-tab detection (NEW-USER-SETTINGS).
+            // An existing stored choice is never overridden.
+            if defaults.object(forKey: "browserCallDetection") == nil {
+                defaults.set(false, forKey: "browserCallDetection")
+            }
+        } else if defaults.object(forKey: "hasCompletedOnboarding") == nil {
+            // Existing installs were already set up; Settings can rerun setup.
+            defaults.set(true, forKey: "hasCompletedOnboarding")
+        }
+
+        let savedSummaryModel = defaults.string(forKey: "summaryModel")
         let legacyModelIDs = ["qwen3-4b", "gemma3n-e2b"]
         let initialSummaryModel = ModelItem.initialSelection(savedID: savedSummaryModel)
         selectedModel = initialSummaryModel
         if let savedSummaryModel, legacyModelIDs.contains(savedSummaryModel) {
-            UserDefaults.standard.set(initialSummaryModel.id, forKey: "summaryModel")
+            defaults.set(initialSummaryModel.id, forKey: "summaryModel")
         }
         // Older builds exposed an auto-record preference. Never honour a value
         // left behind by those versions: calendar and browser signals may only
         // prompt the user, never begin capture without an explicit action.
-        UserDefaults.standard.set(false, forKey: "autoRecord")
+        defaults.set(false, forKey: "autoRecord")
         calendarService = CalendarService()
+        calendarAuthorization = calendarService.authorizationStatus
         let root = AppModel.recordingsRoot()
         let recovered = RecordingSession.recoverInterruptedSessions(in: root)
         if !recovered.isEmpty {
@@ -109,7 +180,11 @@ final class AppModel: ObservableObject {
             }
             await coordinator.resumePending(root: root)
         }
-        startTranscriptPolling()
+        calendarAuthorizationObserver = calendarService.$authorizationStatus
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                MainActor.assumeIsolated { self?.calendarAuthorization = status }
+            }
         syncCalendarState()
         calendarTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.syncCalendarState() }
@@ -127,8 +202,7 @@ final class AppModel: ObservableObject {
                 await self.coordinator.handleMemoryPressure()
                 if self.recording {
                     self.liveTranscriptionSuspendedForResources = true
-                    self.liveTranscriptionStatus = "Background transcription paused to protect your recording. Saved audio will be processed after the meeting."
-                    self.status = "● Recording · live transcript paused to protect recording"
+                    self.liveTranscriptionStatus = "Live transcript paused to protect your recording. Saved audio will be transcribed after the meeting."
                 }
                 self.refreshReadyStateAfterUnload()
             }
@@ -137,11 +211,13 @@ final class AppModel: ObservableObject {
         memoryPressureSource = pressure
     }
 
-    static func recordingsRoot() -> URL {
+    nonisolated static func recordingsRoot() -> URL {
         Config.resolveRoot(cliOverride: nil)
     }
 
-    func toggleRecording() { recording ? stop() : start() }
+    var isCalendarConnected: Bool { calendarAuthorization == .fullAccess }
+
+    func toggleRecording() { recording || isStartingRecording ? stop() : start() }
 
     func startIfNotRecording() {
         guard !recording && !isStartingRecording else { return }
@@ -161,19 +237,24 @@ final class AppModel: ObservableObject {
     }
 
     var calendarStatusText: String {
-        if !calendarService.isAuthorized { return "Calendar access is not connected" }
+        if !isCalendarConnected { return "Calendar isn’t connected" }
         if let activeMeeting { return "In meeting: \(activeMeeting.title)" }
         if let upcomingMeeting {
             return "Next: \(upcomingMeeting.title) · \(Self.relative(upcomingMeeting.start))"
         }
-        return "No upcoming meetings detected"
+        return "No upcoming meetings"
+    }
+
+    func setStatus(_ text: String, tone: AppStatusTone = .normal) {
+        status = text
+        statusTone = tone
     }
 
     func start(context: MeetingContext? = nil, customTitle: String? = nil) {
         guard !recording && !isStartingRecording && !isFinalizingRecording else { return }
         let devices = AudioInputDevice.available()
         guard !devices.isEmpty else {
-            status = "⚠ No microphone input is available"
+            setStatus("No microphone is available. Connect or enable one, then try again.", tone: .warning)
             notifyUser(title: "Sekitiri — recording unavailable", body: "Connect or enable a microphone, then try again.")
             return
         }
@@ -181,7 +262,10 @@ final class AppModel: ObservableObject {
         let inputDeviceID = devices.contains(where: { $0.id == requestedDeviceID }) ? requestedDeviceID : AudioInputDevice.defaultID()
         let systemAudio = UserDefaults.standard.object(forKey: "systemAudio") as? Bool ?? true
         let source = context ?? calendarService.activeMeeting ?? upcomingMeeting
-        let requestedTitle = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The draft title is pre-filled from the calendar; only a title the
+        // user actually changed becomes an override.
+        let typedTitle = customTitle ?? (context == nil && draftMeetingTitle != source?.title ? draftMeetingTitle : nil)
+        let requestedTitle = typedTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let meeting = source.map { MeetingContext(eventID: $0.eventID, title: requestedTitle.isEmpty ? $0.title : requestedTitle, start: $0.start, end: $0.end, attendees: $0.attendees, meetingURL: $0.meetingURL) }
             ?? (requestedTitle.isEmpty ? nil : MeetingContext(eventID: "manual-\(UUID().uuidString)", title: requestedTitle, start: Date(), end: Date().addingTimeInterval(3600), attendees: [], meetingURL: nil))
 
@@ -189,8 +273,9 @@ final class AppModel: ObservableObject {
         recordingStartGeneration &+= 1
         let startGeneration = recordingStartGeneration
         showingCompletedRecording = false
+        transcriptionProgress = nil
         recordingTitle = meeting?.title ?? (requestedTitle.isEmpty ? "Untitled meeting" : requestedTitle)
-        status = "Starting recorder…"
+        setStatus("Starting recorder…")
         let recordingsRoot = AppModel.recordingsRoot()
         Task { [weak self] in
             if let summary = self?.activeSummaryTask {
@@ -231,6 +316,7 @@ final class AppModel: ObservableObject {
         newSession.updateTitle(recordingTitle)
         session = newSession
         recording = true
+        recordingStartedAt = newSession.startedAt
         recordingMeeting = meeting
         recordingCallWasDetected = calendarService.detectedCall != nil
             || meeting?.eventID.hasPrefix("browser-") == true
@@ -238,27 +324,38 @@ final class AppModel: ObservableObject {
         safetyPromptKeys.removeAll()
         longRecordingReminderMinutes.removeAll()
         recordingSafetyPrompt = nil
-        recordingSafetyStatus = ""
         lastAudioActivityAt = Date()
+        lastMicActivityAt = Date()
         hasAudioActivity = false
+        isHearingAudio = false
+        noSoundWarning = false
+        micSilenceWarning = false
+        silenceStopDeadline = nil
         isStartingRecording = false
         isPaused = false
         pausedDuration = 0
         pausedAt = nil
+        markedMoments = []
         additionalNotes = ""
         additionalNotesSaveStatus = ""
         additionalNotesSaveError = nil
-        status = meeting.map { "● Recording · \($0.title)" } ?? "● Recording"
-        latestTranscript = "Recording… transcript will appear here."
+        draftMeetingTitle = ""
+        setStatus("Recording", tone: .recording)
         liveSegments = []
         liveTranscriptionStatus = "Preparing local transcription…"
         liveTranscriptionSuspendedForResources = false
-        lastTranscriptPath = nil
         newSession.onCaptureHealthChange = { [weak self] health in
             Task { @MainActor [weak self] in self?.captureHealthDidChange(health) }
         }
         newSession.onAudioActivityChange = { [weak self] active in
             Task { @MainActor [weak self] in self?.audioActivityDidChange(active) }
+        }
+        newSession.onMicActivityChange = { [weak self] active in
+            Task { @MainActor [weak self] in
+                guard let self, active, self.recording, !self.isPaused else { return }
+                self.lastMicActivityAt = Date()
+                if self.micSilenceWarning { self.micSilenceWarning = false }
+            }
         }
         startLiveTranscription(for: newSession)
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
@@ -271,9 +368,9 @@ final class AppModel: ObservableObject {
         }
         if let sessionDirectory { try? FileManager.default.removeItem(at: sessionDirectory) }
         isStartingRecording = false
-        status = "⚠ Recording failed: \(error)"
+        setStatus("Recording couldn’t start: \(error.localizedDescription)", tone: .warning)
         Task { [coordinator] in await coordinator.endRecordingWithoutEnqueue() }
-        notifyUser(title: "Sekitiri — recording failed", body: "\(error)")
+        notifyUser(title: "Sekitiri — recording failed", body: error.localizedDescription)
     }
 
     func stop() {
@@ -285,7 +382,7 @@ final class AppModel: ObservableObject {
         let stoppedAt = Date()
         let secs = elapsedDuration(for: session, at: stoppedAt)
         isFinalizingRecording = true
-        status = "Finishing recording…"
+        setStatus("Saving recording…")
         elapsed = Self.format(secs)
         ticker?.invalidate()
         ticker = nil
@@ -295,10 +392,10 @@ final class AppModel: ObservableObject {
             // interface remains responsive and background ASR sources survive.
             let invalidTracks = await session.stop()
             guard let self else { return }
-            self.status = invalidTracks.isEmpty
-                ? "Recording saved — finishing transcript…"
-                : "⚠ Recording needs attention: \(invalidTracks.joined(separator: ", ")). Available audio was preserved."
-            if !invalidTracks.isEmpty {
+            if invalidTracks.isEmpty {
+                self.setStatus("Recording saved")
+            } else {
+                self.setStatus("Recording needs attention: \(invalidTracks.joined(separator: ", ")). Available audio was preserved.", tone: .warning)
                 notifyUser(title: "Sekitiri — recording needs attention",
                            body: invalidTracks.joined(separator: ", "))
             }
@@ -308,17 +405,30 @@ final class AppModel: ObservableObject {
             self.isPaused = false
             self.showingCompletedRecording = true
             self.recordingMeeting = nil
-            self.lastAudioActivityAt = nil
-            self.hasAudioActivity = false
+            self.resetCaptureIndicators()
             self.recordingCallWasDetected = false
             self.liveTranscriptionSuspendedForResources = false
             self.recordingSafetyPrompt = nil
-            self.recordingSafetyStatus = ""
-            self.liveTranscriptionStatus = "Finishing saved transcript sections…"
-            self.isTranscribing = Config.transcriptionEnabled()
+            self.liveTranscriptionStatus = ""
+            let transcribes = Config.transcriptionEnabled()
+            self.isTranscribing = transcribes
+            self.transcriptionProgress = transcribes
+                ? TranscriptionProgressInfo(session: session.dir.lastPathComponent, fractionCompleted: nil,
+                                            secondsRemaining: nil, stage: TranscriptionProgressInfo.Stage.saved)
+                : nil
+            self.archiveRevision &+= 1
             await LocalSummaryRuntime.shared.unload()
             await coordinator.endRecordingAndEnqueue(session.dir)
             self.isFinalizingRecording = false
+        }
+    }
+
+    /// Used when quitting: stops capture and waits (bounded) until files are closed.
+    func stopAndWaitForSave() async {
+        if recording || isStartingRecording { stop() }
+        let deadline = Date().addingTimeInterval(15)
+        while (recording || isFinalizingRecording), Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
         }
     }
 
@@ -333,7 +443,7 @@ final class AppModel: ObservableObject {
         elapsed = "0:00"
         liveSegments = []
         liveTranscriptionStatus = ""
-        status = "Recording start cancelled"
+        setStatus("Recording start cancelled")
         Task { [coordinator] in await coordinator.endRecordingWithoutEnqueue() }
     }
 
@@ -349,7 +459,7 @@ final class AppModel: ObservableObject {
         isFinalizingRecording = true
         ticker?.invalidate()
         ticker = nil
-        status = "Discarding recording…"
+        setStatus("Discarding recording…")
         Task { [weak self, coordinator] in
             await coordinator.stopLiveAndWait()
             _ = await session.stop()
@@ -361,14 +471,14 @@ final class AppModel: ObservableObject {
             self.isPaused = false
             self.showingCompletedRecording = false
             self.recordingMeeting = nil
-            self.lastAudioActivityAt = nil
-            self.hasAudioActivity = false
+            self.resetCaptureIndicators()
+            self.recordingStartedAt = nil
             self.lastCompletedSessionDirectory = nil
             self.liveSegments = []
             self.liveTranscriptionStatus = ""
             self.additionalNotes = ""
             self.additionalNotesSaveStatus = ""
-            self.status = "Recording discarded"
+            self.setStatus("Recording discarded")
             await coordinator.endRecordingWithoutEnqueue()
             self.isFinalizingRecording = false
         }
@@ -377,34 +487,108 @@ final class AppModel: ObservableObject {
     func deleteCompletedAudio() {
         guard let directory = lastCompletedSessionDirectory else { return }
         guard !isTranscribing, TranscriptIntegrity.isComplete(at: directory) else {
-            status = "Finish or retry transcription before deleting its source audio."
+            setStatus("Finish or retry transcription before deleting its source audio.", tone: .warning)
             return
         }
         do {
             try MeetingNotesService.deleteAudio(for: directory)
-            status = "Audio deleted — transcript and notes are kept"
+            setStatus("Audio deleted — transcript and notes are kept")
         } catch {
-            status = "⚠ Couldn’t delete audio: \(error.localizedDescription)"
+            setStatus("Couldn’t delete audio: \(error.localizedDescription)", tone: .warning)
         }
     }
 
     func deleteCompletedMeeting() {
-        guard !isTranscribing else {
-            status = "Wait for transcription to finish before deleting the meeting."
-            return
-        }
         guard let directory = lastCompletedSessionDirectory else { return }
+        guard deleteMeeting(session: directory) else { return }
+        lastCompletedSessionDirectory = nil
+        showingCompletedRecording = false
+        transcriptionProgress = nil
+        recordingTitle = ""
+        additionalNotes = ""
+        liveSegments = []
+    }
+
+    /// Deletes a meeting's capture folder and its vault copy. Returns false and
+    /// explains why when deletion isn't safe right now.
+    @discardableResult
+    func deleteMeeting(session directory: URL) -> Bool {
+        guard !isTranscribing else {
+            setStatus("Wait for transcription to finish before deleting a meeting.", tone: .warning)
+            return false
+        }
         do {
-            try MeetingNotesService.deleteMeeting(for: directory)
-            lastCompletedSessionDirectory = nil
-            showingCompletedRecording = false
-            recordingTitle = ""
-            additionalNotes = ""
-            liveSegments = []
-            latestTranscript = "No transcript yet."
-            status = "Meeting deleted"
+            let trashed = try MeetingNotesService.trashMeeting(for: directory)
+            if lastCompletedSessionDirectory?.standardizedFileURL == directory.standardizedFileURL {
+                lastCompletedSessionDirectory = nil
+                showingCompletedRecording = false
+                transcriptionProgress = nil
+            }
+            archiveRevision &+= 1
+            showToast("Meeting moved to the Trash") { [weak self] in
+                do {
+                    try MeetingNotesService.restore(trashed)
+                    self?.archiveRevision &+= 1
+                    self?.showToast("Meeting restored")
+                } catch {
+                    self?.showToast("Couldn’t restore the meeting. It’s still in the Trash.")
+                }
+            }
+            return true
         } catch {
-            status = "⚠ Couldn’t delete meeting: \(error.localizedDescription)"
+            setStatus("Couldn’t delete meeting: \(error.localizedDescription)", tone: .warning)
+            return false
+        }
+    }
+
+    // MARK: Marked moments
+
+    /// Saves the current point in the recording, labelled with the newest
+    /// live line so the moment is recognisable later.
+    func markMoment() {
+        guard recording, !isPaused, let session else { return }
+        let seconds = elapsedDuration(for: session)
+        let latest = liveSegments.last?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let label = latest.isEmpty ? "Marked moment" : String(latest.prefix(70)) + (latest.count > 70 ? "…" : "")
+        markedMoments.append(MarkedMoment(seconds: seconds, label: label))
+        MarkedMoment.save(markedMoments, in: session.dir)
+        showToast("Moment marked at \(Self.format(seconds))")
+    }
+
+    // MARK: Toasts
+
+    func showToast(_ message: String, undo: (() -> Void)? = nil) {
+        toastDismissTask?.cancel()
+        toast = AppToast(message: message, canUndo: undo != nil)
+        toastUndo = undo
+        toastDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(undo == nil ? 3 : 7))
+            guard !Task.isCancelled else { return }
+            self?.dismissToast()
+        }
+    }
+
+    func dismissToast() {
+        toastDismissTask?.cancel()
+        toast = nil
+        toastUndo = nil
+    }
+
+    func undoToast() {
+        let undo = toastUndo
+        dismissToast()
+        undo?()
+    }
+
+    /// Renames a saved meeting. An empty title restores the original name.
+    @discardableResult
+    func renameMeeting(_ item: MeetingItem, to title: String) -> Bool {
+        do {
+            try MeetingLibrary.rename(item, to: title)
+            archiveRevision &+= 1
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -432,7 +616,13 @@ final class AppModel: ObservableObject {
     }
 
     func retryTranscription(for sessionDirectory: URL) {
-        status = "Retrying transcription…"
+        setStatus("Retrying transcription…")
+        if sessionDirectory.standardizedFileURL == lastCompletedSessionDirectory?.standardizedFileURL {
+            transcriptionProgress = TranscriptionProgressInfo(
+                session: sessionDirectory.lastPathComponent, fractionCompleted: nil,
+                secondsRemaining: nil, stage: TranscriptionProgressInfo.Stage.saved
+            )
+        }
         Task { [coordinator] in await coordinator.enqueue(sessionDirectory) }
     }
 
@@ -450,7 +640,9 @@ final class AppModel: ObservableObject {
                 if let pausedAt { pausedDuration += Date().timeIntervalSince(pausedAt) }
                 self.pausedAt = nil
                 isPaused = false
-                status = "● Recording resumed"
+                // Paused time is never counted as silence.
+                lastAudioActivityAt = Date()
+                setStatus("Recording", tone: .recording)
                 if !liveTranscriptionSuspendedForResources {
                     startLiveTranscription(for: session)
                 }
@@ -458,13 +650,23 @@ final class AppModel: ObservableObject {
                 session.pause()
                 pausedAt = Date()
                 isPaused = true
-                status = "Recording paused"
-                liveTranscriptionStatus = "Live transcription paused"
+                isHearingAudio = false
+                noSoundWarning = false
+                silenceStopDeadline = nil
+                setStatus("Paused")
+                liveTranscriptionStatus = "Live transcript paused"
                 Task { [coordinator] in await coordinator.stopLiveAndWait() }
             }
         } catch {
-            status = "⚠ Couldn’t resume recording: \(error)"
+            setStatus("Couldn’t resume recording: \(error.localizedDescription)", tone: .warning)
         }
+    }
+
+    /// Keeps recording after the stop-after-silence warning.
+    func keepRecordingThroughSilence() {
+        lastAudioActivityAt = Date()
+        silenceStopDeadline = nil
+        noSoundWarning = false
     }
 
     func dismissCompletedRecording() {
@@ -488,14 +690,14 @@ final class AppModel: ObservableObject {
         }
         if selectedModel.id == ModelItem.appleIntelligence.id,
            !LocalSummaryRuntime.appleFoundationModelAvailable {
-            return "Apple Intelligence is unavailable on this Mac. Choose Qwen3.5 and download it in Settings."
+            return "Apple Intelligence isn’t available on this Mac. Choose Quick extract or Qwen 3.5."
         }
         guard selectedModel.requiresDownload else { return nil }
         switch localSummaryModelState {
         case .ready: return nil
-        case .notDownloaded: return "Download Qwen3.5 in Settings before summarising."
-        case .downloading: return "Qwen3.5 is still downloading."
-        case .loading: return "Qwen3.5 is loading for another summary."
+        case .notDownloaded: return "Qwen 3.5 isn’t downloaded yet."
+        case .downloading: return "Qwen 3.5 is still downloading."
+        case .loading: return "Qwen 3.5 is loading for another summary."
         case .failed(let message): return message
         }
     }
@@ -514,7 +716,7 @@ final class AppModel: ObservableObject {
     func downloadLocalSummaryModel() {
         guard summaryDownloadTask == nil else { return }
         guard !recording, !isStartingRecording else {
-            status = "Finish the recording before downloading a local model"
+            setStatus("Finish the recording before downloading a local model")
             return
         }
         guard let selection = selectedModel.localModel else { return }
@@ -588,6 +790,7 @@ final class AppModel: ObservableObject {
                 localSummaryModelState = .notDownloaded
                 await refreshLocalSummaryModelState()
             }
+            archiveRevision &+= 1
         } catch {
             // A malformed summary or a cancelled generation does not damage a
             // downloaded model. Keep Regenerate available for another attempt;
@@ -602,6 +805,18 @@ final class AppModel: ObservableObject {
 
     private func refreshReadyStateAfterUnload() {
         if localSummaryModelState == .loading { localSummaryModelState = .ready }
+    }
+
+    private func resetCaptureIndicators() {
+        lastAudioActivityAt = nil
+        lastMicActivityAt = nil
+        hasAudioActivity = false
+        isHearingAudio = false
+        noSoundWarning = false
+        micSilenceWarning = false
+        silenceStopDeadline = nil
+        microphoneTrack = .off
+        systemAudioTrack = .off
     }
 
     /// Writes both active and completed-recording notes to their durable session
@@ -627,18 +842,21 @@ final class AppModel: ObservableObject {
         } catch {
             additionalNotesSaveStatus = ""
             additionalNotesSaveError = "Couldn’t save your additional notes. They are still in this editor—please retry before leaving."
-            status = "⚠ Additional notes could not be saved"
             return false
         }
     }
 
     private func tick() {
         guard let session else { return }
-        elapsed = Self.format(elapsedDuration(for: session))
+        let now = Date()
+        elapsed = Self.format(elapsedDuration(for: session, at: now))
         session.checkpoint()
         protectRecordingFromThermalPressureIfNeeded()
-        evaluateRecordingSafety(now: Date())
-        pollLatestTranscript()
+        if isHearingAudio, let last = lastAudioActivityAt, now.timeIntervalSince(last) > 2 {
+            isHearingAudio = false
+        }
+        evaluateSilence(now: now)
+        evaluateRecordingSafety(now: now)
     }
 
     private func protectRecordingFromThermalPressureIfNeeded() {
@@ -646,8 +864,7 @@ final class AppModel: ObservableObject {
         switch ProcessInfo.processInfo.thermalState {
         case .serious, .critical:
             liveTranscriptionSuspendedForResources = true
-            liveTranscriptionStatus = "Background transcription paused because this Mac is under heavy load. Recording continues safely."
-            status = "● Recording · live transcript paused under heavy load"
+            liveTranscriptionStatus = "Live transcript paused because this Mac is under heavy load. Recording continues safely."
             Task { [coordinator] in await coordinator.stopLiveAndWait() }
         case .nominal, .fair:
             break
@@ -676,8 +893,9 @@ final class AppModel: ObservableObject {
             }, onStatus: { [weak self] message in
                 Task { @MainActor [weak self] in
                     guard self?.session?.dir == session.dir else { return }
+                    // Transcript progress stays with the transcript; it never
+                    // replaces the recording status line.
                     self?.liveTranscriptionStatus = message
-                    if !(self?.isPaused ?? false) { self?.status = message }
                 }
             })
         }
@@ -686,14 +904,29 @@ final class AppModel: ObservableObject {
     private func captureHealthDidChange(_ health: RecordingSession.CaptureHealth) {
         switch health {
         case .idle:
-            captureHealthStatus = "Capture stopped"
-        case .recording(let microphone, let systemAudio):
-            captureHealthStatus = "\(microphone.label) · \(systemAudio.label)"
-        case .paused(let microphone, let systemAudio):
-            captureHealthStatus = "Paused · \(microphone.label) · \(systemAudio.label)"
-        case .degraded(_, _, let message):
-            captureHealthStatus = message
+            microphoneTrack = .off
+            systemAudioTrack = .off
+        case .recording(let microphone, let systemAudio),
+             .paused(let microphone, let systemAudio):
+            applyTrackHealth(microphone: microphone, systemAudio: systemAudio)
+        case .degraded(let microphone, let systemAudio, let message):
+            applyTrackHealth(microphone: microphone, systemAudio: systemAudio)
             notifyUser(title: "Sekitiri — capture connection changed", body: message)
+        }
+    }
+
+    private func applyTrackHealth(microphone: MicRecorder.Health, systemAudio: SystemAudioRecorder.Health) {
+        switch microphone {
+        case .idle: microphoneTrack = .off
+        case .recording(let name): microphoneTrack = .recording; microphoneDeviceName = name
+        case .paused(let name): microphoneTrack = .paused; microphoneDeviceName = name
+        case .unavailable(let message): microphoneTrack = .degraded(message)
+        }
+        switch systemAudio {
+        case .idle: systemAudioTrack = .off
+        case .recording: systemAudioTrack = .recording
+        case .paused: systemAudioTrack = .paused
+        case .unavailable(let message): systemAudioTrack = .degraded(message)
         }
     }
 
@@ -701,6 +934,9 @@ final class AppModel: ObservableObject {
         guard active, recording, !isPaused else { return }
         hasAudioActivity = true
         lastAudioActivityAt = Date()
+        if !isHearingAudio { isHearingAudio = true }
+        if noSoundWarning { noSoundWarning = false }
+        if silenceStopDeadline != nil { silenceStopDeadline = nil }
     }
 
     private func syncCalendarState() {
@@ -708,7 +944,10 @@ final class AppModel: ObservableObject {
         activeMeeting = calendarService.activeMeeting
         upcomingMeeting = calendarService.upcomingMeeting
         todaySchedule = calendarService.todaySchedule
-        if !recording, draftMeetingTitle.isEmpty {
+        if calendarAuthorization != calendarService.authorizationStatus {
+            calendarAuthorization = calendarService.authorizationStatus
+        }
+        if !recording, !isStartingRecording, draftMeetingTitle.isEmpty {
             draftMeetingTitle = activeMeeting?.title ?? upcomingMeeting?.title ?? ""
         }
         // Allow a later re-entry to the same browser call to prompt again,
@@ -719,25 +958,50 @@ final class AppModel: ObservableObject {
         sendMeetingReminderIfNeeded(for: upcomingMeeting)
         promptForDetectedCallIfNeeded()
         evaluateRecordingSafety(now: Date())
+    }
 
+    /// Stop-after-silence: warns after 30 s without sound, warns again one
+    /// minute before the configured silence limit, then stops and saves.
+    private func evaluateSilence(now: Date) {
+        guard recording, !isPaused, let session else { return }
+        let reference = lastAudioActivityAt ?? session.startedAt
+        let silence = now.timeIntervalSince(reference)
+        let quiet = silence >= Self.noSoundWarningSeconds
+        if noSoundWarning != quiet { noSoundWarning = quiet }
+        let micSilence = now.timeIntervalSince(lastMicActivityAt ?? session.startedAt)
+        let micQuiet = !quiet && micSilence >= Self.micSilenceWarningSeconds
+        if micSilenceWarning != micQuiet { micSilenceWarning = micQuiet }
+
+        let minutes = UserDefaults.standard.integer(forKey: "recordingSafetyTimeoutMinutes")
+        guard minutes > 0 else {
+            if silenceStopDeadline != nil { silenceStopDeadline = nil }
+            return
+        }
+        let limit = TimeInterval(minutes * 60)
+        if silence >= limit {
+            silenceStopDeadline = nil
+            notifyUser(title: "Sekitiri — recording stopped",
+                       body: "No sound for \(minutes) minutes, so Sekitiri stopped and saved the recording.")
+            stop()
+        } else if silence >= limit - Self.silenceStopWarningSeconds {
+            if silenceStopDeadline == nil {
+                silenceStopDeadline = reference.addingTimeInterval(limit)
+                notifyUser(title: "Sekitiri — no sound detected",
+                           body: "Recording stops in about a minute unless sound resumes. Open Sekitiri to keep recording.")
+            }
+        } else if silenceStopDeadline != nil {
+            silenceStopDeadline = nil
+        }
     }
 
     private func evaluateRecordingSafety(now: Date) {
-        guard recording, !isPaused, recordingSafetyPrompt == nil else { return }
-        let duration = elapsedDuration(for: session!, at: now)
-        let reminderMarks = [(60, "You have been recording for one hour."), (90, "You have been recording for 90 minutes.")]
+        guard recording, !isPaused, recordingSafetyPrompt == nil, let session else { return }
+        let duration = elapsedDuration(for: session, at: now)
+        let reminderMarks = [(60, "You’ve been recording for an hour."), (90, "You’ve been recording for 90 minutes.")]
         for (minutes, message) in reminderMarks where duration >= TimeInterval(minutes * 60) {
             guard longRecordingReminderMinutes.insert(minutes).inserted else { continue }
-            recordingSafetyStatus = message + " Sekitiri will keep recording until you stop it."
-            notifyUser(title: "Sekitiri — recording still active", body: recordingSafetyStatus)
-        }
-
-        if let timeout = UserDefaults.standard.object(forKey: "recordingSafetyTimeoutMinutes") as? Int,
-           timeout > 0, duration >= TimeInterval(timeout * 60),
-           safetyPromptKeys.insert("timeout-\(timeout)").inserted {
-            notifyUser(title: "Sekitiri — safety timeout reached", body: "The configured recording safety timeout has stopped this recording.")
-            stop()
-            return
+            setStatus("Recording · \(message)", tone: .recording)
+            notifyUser(title: "Sekitiri — recording still active", body: message + " Sekitiri keeps recording until you stop it.")
         }
 
         if let meeting = recordingMeeting, meeting.end <= now,
@@ -761,7 +1025,7 @@ final class AppModel: ObservableObject {
 
     func keepRecordingAfterSafetyPrompt() {
         recordingSafetyPrompt = nil
-        recordingSafetyStatus = "Still recording — stop manually when the meeting is over."
+        setStatus("Recording · stop manually when the meeting is over", tone: .recording)
     }
 
     private func sendMeetingReminderIfNeeded(for meeting: MeetingContext?) {
@@ -789,60 +1053,65 @@ final class AppModel: ObservableObject {
     }
 
     private func transcriptionStatus(_ state: TranscriptionCoordinator.Status) {
+        typealias Stage = TranscriptionProgressInfo.Stage
         switch state {
         case .idle:
             isTranscribing = false
+            if transcriptionProgress?.stage == Stage.speakers {
+                transcriptionProgress?.stage = Stage.ready
+                transcriptionProgress?.fractionCompleted = 1
+                transcriptionProgress?.secondsRemaining = nil
+            }
+            archiveRevision &+= 1
         case .transcribing(let name, let queued):
             isTranscribing = true
-            status = "Finishing transcript for \(name)\(queued > 0 ? " · \(queued) queued" : "")…"
+            if !recording, !isStartingRecording {
+                setStatus(queued > 0 ? "Transcribing · \(queued) more queued" : "Transcribing")
+            }
+            if transcriptionProgress?.session == name {
+                transcriptionProgress?.stage = Stage.transcribing
+            } else if name == lastCompletedSessionDirectory?.lastPathComponent {
+                transcriptionProgress = TranscriptionProgressInfo(session: name, fractionCompleted: nil,
+                                                                  secondsRemaining: nil, stage: Stage.transcribing)
+            }
+        case .progress(let name, let progress):
+            isTranscribing = true
+            if transcriptionProgress?.session != name, name == lastCompletedSessionDirectory?.lastPathComponent {
+                transcriptionProgress = TranscriptionProgressInfo(session: name, fractionCompleted: nil,
+                                                                  secondsRemaining: nil, stage: Stage.transcribing)
+            }
+            guard transcriptionProgress?.session == name else { break }
+            transcriptionProgress?.fractionCompleted = progress.fraction
+            transcriptionProgress?.secondsRemaining = progress.secondsRemaining
+            if progress.stage == .identifyingSpeakers { transcriptionProgress?.stage = Stage.speakers }
         case .ready(let name, let issues):
-            // The final job may still be releasing its model or enriching
-            // speaker labels; .idle releases the shared resource permit.
-            status = issues.isEmpty ? "Transcript ready · \(name)"
-                : "⚠ Transcript incomplete: \(issues.joined(separator: "; "))"
-            liveTranscriptionStatus = issues.isEmpty ? "Transcript saved" : "Some audio needs attention"
-            pollLatestTranscript()
+            // The final job may still be enriching speaker labels; .idle
+            // releases the shared resource permit.
+            if issues.isEmpty {
+                if !recording, !isStartingRecording { setStatus("Transcript ready") }
+                if transcriptionProgress?.session == name {
+                    transcriptionProgress?.stage = Config.speakerDiarizationEnabled() ? Stage.speakers : Stage.ready
+                    transcriptionProgress?.fractionCompleted = 1
+                    transcriptionProgress?.secondsRemaining = nil
+                }
+            } else {
+                if !recording, !isStartingRecording {
+                    setStatus("Transcript incomplete — some audio couldn’t be transcribed. The recording is preserved.", tone: .warning)
+                }
+                if transcriptionProgress?.session == name { transcriptionProgress?.stage = Stage.failed }
+            }
+            archiveRevision &+= 1
         case .failed(let name, let message):
             isTranscribing = false
-            status = "⚠ Transcription needs attention: \(name) — \(message)"
-            liveTranscriptionStatus = "Your recording and completed sections were preserved for retry."
+            if !recording, !isStartingRecording {
+                setStatus("Transcription needs attention: \(message)", tone: .warning)
+            }
+            if transcriptionProgress?.session == name { transcriptionProgress?.stage = Stage.failed }
+            archiveRevision &+= 1
         }
     }
 
-    private func startTranscriptPolling() {
-        transcriptPollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.pollLatestTranscript() }
-        }
-    }
-
-    private func pollLatestTranscript() {
-        guard !recording else { return }
-        let root = AppModel.recordingsRoot()
-        guard let latest = newestRecording(in: root) else { return }
-        let diarized = latest.appendingPathComponent("transcript.diarized.md")
-        let plain = latest.appendingPathComponent("transcript.md")
-        // New pipeline writes canonical plain text. Legacy diarization is only
-        // preferred for a recording that has never used the new format.
-        let modern = FileManager.default.fileExists(atPath: latest.appendingPathComponent("transcription-settings.json").path)
-        let path = !modern && FileManager.default.fileExists(atPath: diarized.path) ? diarized : plain
-        if let text = try? String(contentsOf: path, encoding: .utf8), !text.isEmpty {
-            latestTranscript = text
-            lastTranscriptPath = path.path
-            liveSegments = []
-        }
-    }
-
-    private func newestRecording(in root: URL) -> URL? {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: nil
-        ) else { return nil }
-        return entries
-            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
-            .first
-    }
-
-    private static func format(_ interval: TimeInterval) -> String {
+    static func format(_ interval: TimeInterval) -> String {
         let total = Int(interval)
         let h = total / 3600, m = (total % 3600) / 60, s = total % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
@@ -861,24 +1130,83 @@ struct SekitiriApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        Window("Sekitiri", id: MainWindow.id) {
             ContentView()
                 .environmentObject(appDelegate.model)
         }
-        .defaultSize(width: 960, height: 680)
+        .defaultSize(width: 1280, height: 820)
+        .windowStyle(.hiddenTitleBar)
+        .windowBackgroundDragBehavior(.enabled)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    MainWindow.show()
+                    NotificationCenter.default.post(name: .sekitiriShowSettings, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+            RecordingCommands(model: appDelegate.model)
+        }
+
+        MenuBarExtra {
+            MenuBarPanel()
+                .environmentObject(appDelegate.model)
+                .tint(SekitiriColor.terracotta)
+        } label: {
+            MenuBarLabel(model: appDelegate.model)
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
+
+/// Reopens the single main window from AppKit code (menu bar, Dock).
+@MainActor
+enum MainWindow {
+    static let id = "main"
+    /// Captured from the window's environment the first time it appears.
+    static var openAction: OpenWindowAction?
+
+    static func show() {
+        NSApp.activate()
+        if let openAction {
+            openAction(id: id)
+        } else if let window = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix(id) == true }) {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+}
+
+struct RecordingCommands: Commands {
+    @ObservedObject var model: AppModel
+
+    var body: some Commands {
+        CommandMenu("Recording") {
+            Button(model.recording ? "Stop Recording" : model.isStartingRecording ? "Cancel Recording Start" : "Start Recording") {
+                if model.recording || model.isStartingRecording { model.stop() } else { model.startIfNotRecording() }
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
+            .disabled(model.isFinalizingRecording)
+
+            Button(model.isPaused ? "Resume Recording" : "Pause Recording") { model.togglePause() }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(!model.recording || model.isFinalizingRecording)
+
+            Button("Mark Moment") { model.markMoment() }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .disabled(!model.recording || model.isPaused)
+        }
     }
 }
 
 // MARK: - App delegate (menu bar, control server)
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
-    private var statusItem: NSStatusItem?
     private var controlServer: RecordingControlServer?
-    private var recordingMenuItem: NSMenuItem?
     private var globalStopMonitor: Any?
     private var localStopMonitor: Any?
+    private var miniRecorder: MiniRecorderController?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Sekitiri is also the meeting detector. Closing the window should
@@ -887,8 +1215,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         false
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { MainWindow.show() }
+        return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard model.recording || model.isStartingRecording || model.isFinalizingRecording else { return .terminateNow }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Stop recording and quit?"
+        alert.informativeText = "Sekitiri will stop and save this recording first. Transcription continues the next time you open Sekitiri."
+        alert.addButton(withTitle: "Stop and Quit")
+        alert.addButton(withTitle: "Keep Recording")
+        NSApp.activate()
+        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        Task { @MainActor [model] in
+            await model.stopAndWaitForSave()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        DevSnapshot.runIfRequested(model: model)
 
         controlServer = try? RecordingControlServer { [weak self] action in
             Task { @MainActor in
@@ -915,44 +1266,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return nil
         }
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let btn = item.button {
-            btn.image = NSImage(systemSymbolName: "waveform.circle",
-                                accessibilityDescription: "Sekitiri")
-            btn.image?.isTemplate = true
-        }
-        let menu = NSMenu()
-        menu.delegate = self
-        menu.autoenablesItems = false
-        let rec = NSMenuItem(title: "● Start Recording",
-                             action: #selector(toggleRecording), keyEquivalent: "")
-        rec.target = self
-        menu.addItem(rec)
-        recordingMenuItem = rec
-        menu.addItem(NSMenuItem.separator())
-        let open = NSMenuItem(title: "Open Sekitiri",
-                              action: #selector(openWindow), keyEquivalent: "w")
-        open.target = self
-        menu.addItem(open)
-        menu.addItem(NSMenuItem.separator())
-        let quit = NSMenuItem(title: "Quit Sekitiri",
-                              action: #selector(quit), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-        item.menu = menu
-        statusItem = item
-    }
-
-    @objc func toggleRecording() {
-        if model.isStartingRecording { model.stop() }
-        else { model.toggleRecording() }
-    }
-    @objc func openWindow() { NSApp.activate(ignoringOtherApps: true) }
-    @objc func quit() { NSApp.terminate(nil) }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        recordingMenuItem?.title = model.recording
-            ? "■ Stop Recording"
-            : model.isStartingRecording ? "■ Cancel Recording Start" : "● Start Recording"
+        miniRecorder = MiniRecorderController(model: model)
     }
 }

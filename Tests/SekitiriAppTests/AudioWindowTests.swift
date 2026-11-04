@@ -97,30 +97,30 @@ struct AudioWindowTests {
     func reconcileOverlap() {
         // Fake recognizer emits the same words in adjacent context windows.
         let left = [
-            WordTiming(word: "before", startTime: 24.2, endTime: 24.8),
-            WordTiming(word: "boundary", startTime: 25.7, endTime: 26.3),
-            WordTiming(word: "after", startTime: 26.5, endTime: 27.0),
+            TranscriptWord(text: "before", start: 24.2, end: 24.8),
+            TranscriptWord(text: "boundary", start: 25.7, end: 26.3),
+            TranscriptWord(text: "after", start: 26.5, end: 27.0),
         ]
         let right = left.map {
-            WordTiming(word: $0.word, startTime: $0.startTime - 24, endTime: $0.endTime - 24)
+            TranscriptWord(text: $0.text, start: $0.start - 24, end: $0.end - 24)
         }
         let kept = ParakeetEngine.retainedWords(left, offset: 0, retaining: 0..<26)
             + ParakeetEngine.retainedWords(right, offset: 24, retaining: 26..<52)
-        #expect(kept.map(\.word) == ["before", "boundary", "after"])
-        #expect(kept[1].startTime == 25.7)
-        #expect(kept[1].endTime == 26.3)
+        #expect(kept.map(\.text) == ["before", "boundary", "after"])
+        #expect(kept[1].start == 25.7)
+        #expect(kept[1].end == 26.3)
     }
 
     @Test("Model padding cannot introduce speech outside the recorded tail")
     func paddedTailBounds() {
         let words = [
-            WordTiming(word: "Oui.", startTime: 0.01, endTime: 0.1),
-            WordTiming(word: "padding", startTime: 0.2, endTime: 0.3),
+            TranscriptWord(text: "Oui.", start: 0.01, end: 0.1),
+            TranscriptWord(text: "padding", start: 0.2, end: 0.3),
         ]
         let kept = ParakeetEngine.retainedWords(
             words, offset: 26, retaining: 26..<26.05, reading: 24..<26.05
         )
-        #expect(kept.map(\.word) == ["Oui."])
-        #expect(kept.first?.endTime == 26.05)
+        #expect(kept.map(\.text) == ["Oui."])
+        #expect(kept.first?.end == 26.05)
     }
 }

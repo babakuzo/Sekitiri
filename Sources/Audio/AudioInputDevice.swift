@@ -34,15 +34,16 @@ struct AudioInputDevice: Identifiable, Hashable {
             let channels = UnsafeMutableAudioBufferListPointer(list).reduce(0) { $0 + Int($1.mNumberChannels) }
             guard channels > 0 else { return nil }
 
-            var name: CFString = "Unknown input" as CFString
-            var nameSize = UInt32(MemoryLayout<CFString>.size)
+            var name: Unmanaged<CFString>?
+            var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
             var nameAddress = AudioObjectPropertyAddress(
                 mSelector: kAudioObjectPropertyName,
                 mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain
             )
-            guard AudioObjectGetPropertyData(id, &nameAddress, 0, nil, &nameSize, &name) == noErr else { return nil }
-            return AudioInputDevice(id: "\(id)", deviceID: id, name: name as String)
+            guard AudioObjectGetPropertyData(id, &nameAddress, 0, nil, &nameSize, &name) == noErr,
+                  let name else { return nil }
+            return AudioInputDevice(id: "\(id)", deviceID: id, name: name.takeRetainedValue() as String)
         }
         .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }

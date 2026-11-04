@@ -251,7 +251,8 @@ struct LocalPipelineBenchmarkTests {
                     await recorder.mark(runID + ":inference")
                     var completed: TimeInterval = 0
                     var segments: [TranscriptSegment] = []
-                    while let window = TranscriptionWindow.next(after: completed, available: duration, final: true) {
+                    while let plan = try await engine.planWindow(sourceURLs: [audio], after: completed, available: duration, final: true) {
+                        let window = plan.window
                         segments += try await engine.transcribeWindow(sourceURLs: [audio], start: window.readStart,
                             duration: window.readEnd - window.readStart, retaining: window.coreStart..<window.coreEnd)
                         completed = window.coreEnd

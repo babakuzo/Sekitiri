@@ -47,6 +47,14 @@ private actor CoordinatorTestEngine: WindowedTranscriptionEngine {
         gate = nil
     }
 
+    /// Coordinator behaviour is independent of window geometry; these tests
+    /// keep the original fixed 26 s cores so expectations stay readable.
+    func planWindow(sourceURLs: [URL], after completed: TimeInterval,
+                    available: TimeInterval, final: Bool) async throws -> WindowPlan? {
+        TranscriptionWindow.next(after: completed, available: available, final: final, core: 26, context: 2)
+            .map { WindowPlan(window: $0) }
+    }
+
     func transcribeWindow(sourceURLs: [URL], start: TimeInterval, duration: TimeInterval,
                           retaining: Range<TimeInterval>?) async throws -> [TranscriptSegment] {
         let core = retaining ?? start..<(start + duration)
@@ -66,8 +74,12 @@ private actor CoordinatorTestEngine: WindowedTranscriptionEngine {
         }
         if failureCore == core.lowerBound { throw CocoaError(.fileReadUnknown) }
         let segmentEnd = min(core.upperBound, core.lowerBound + 1)
-        return [TranscriptSegment(start: core.lowerBound, end: segmentEnd,
-                                  text: "Saved speech at \(Int(core.lowerBound)) seconds.")]
+        // Different words per track: identical simultaneous text on both
+        // tracks is what echo suppression removes.
+        let text = sourceURLs.first?.path.contains("system") == true
+            ? "A colleague replied after \(Int(core.lowerBound)) seconds."
+            : "Saved speech at \(Int(core.lowerBound)) seconds."
+        return [TranscriptSegment(start: core.lowerBound, end: segmentEnd, text: text)]
     }
 }
 

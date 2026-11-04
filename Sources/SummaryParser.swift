@@ -11,6 +11,19 @@ enum SummaryItem {
     case checkbox(String, checked: Bool)
     case bullet(String)
     case claim(String, sources: [SummaryEvidenceSource], bullet: Bool)
+
+    var text: String {
+        switch self {
+        case .text(let text), .checkbox(let text, _), .bullet(let text), .claim(let text, _, _): return text
+        }
+    }
+}
+
+extension SummarySection {
+    /// True when the model wrote only "None." (or nothing) under this heading.
+    var isEmptyPlaceholder: Bool {
+        items.allSatisfy { OpenActionItem.isPlaceholder($0.text) }
+    }
 }
 
 struct SummaryParser {
@@ -74,15 +87,14 @@ struct SummaryParser {
 struct SummarySectionView: View {
     let section: SummarySection
     var onEvidence: (SummaryEvidenceSource) -> Void = { _ in }
+    var onPlay: ((SummaryEvidenceSource) -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(section.title.uppercased())
-                .font(SekitiriType.body(10, weight: .medium))
-                .foregroundColor(SekitiriColor.terracotta)
+        VStack(alignment: .leading, spacing: 10) {
+            SKSectionHeader(section.title, font: SekitiriType.subTitle)
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(section.items.indices, id: \.self) { i in
-                    SummaryItemView(item: section.items[i], onEvidence: onEvidence)
+                    SummaryItemView(item: section.items[i], onEvidence: onEvidence, onPlay: onPlay)
                 }
             }
         }
@@ -93,16 +105,21 @@ struct SummarySectionView: View {
 struct SummaryItemView: View {
     let item: SummaryItem
     var onEvidence: (SummaryEvidenceSource) -> Void = { _ in }
+    var onPlay: ((SummaryEvidenceSource) -> Void)? = nil
 
     var body: some View {
         switch item {
         case .text(let text): content(text)
         case .checkbox(let text, let checked):
-            HStack(alignment: .top, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: checked ? "checkmark.circle.fill" : "circle")
-                    .foregroundColor(checked ? .accentColor : .secondary).font(.system(size: 14)).offset(y: 2)
+                    .foregroundStyle(checked ? SekitiriColor.terracotta : SekitiriColor.muted)
+                    .accessibilityHidden(true)
                 content(text).strikethrough(checked)
-            }.fixedSize(horizontal: false, vertical: true)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .combine)
+            .accessibilityValue(checked ? "Completed" : "Not completed")
         case .bullet(let text): bullet(text)
         case .claim(let text, let sources, let isBullet):
             VStack(alignment: .leading, spacing: 5) {
@@ -110,14 +127,10 @@ struct SummaryItemView: View {
                 if !sources.isEmpty {
                     HStack(spacing: 10) {
                         ForEach(sources) { source in
-                            Button { onEvidence(source) } label: {
-                                Label(source.timestampText ?? "Transcript", systemImage: "text.quote")
-                            }
-                            .buttonStyle(.plain).font(SekitiriType.body(10))
-                            .foregroundStyle(SekitiriColor.terracotta)
-                            .accessibilityLabel("Show transcript source \(source.timestampText ?? "")")
+                            EvidenceChip(source: source, onOpen: { onEvidence(source) }, onPlay: onPlay)
                         }
                     }
+                    .padding(.leading, isBullet ? 18 : 0)
                 }
             }
         }
@@ -125,16 +138,46 @@ struct SummaryItemView: View {
 
     private func content(_ text: String) -> some View {
         Text(SummaryParser.inline(text))
-            .font(.system(size: 16, design: .serif))
-            .foregroundColor(SekitiriColor.ink).lineSpacing(4)
-            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            .font(SekitiriType.reading)
+            .foregroundStyle(SekitiriColor.ink)
+            .lineSpacing(3)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func bullet(_ text: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text("•").foregroundColor(.secondary)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text("•").foregroundStyle(SekitiriColor.muted).accessibilityHidden(true)
             content(text)
-        }.fixedSize(horizontal: false, vertical: true)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// A transcript reference attached to a summary claim. Click shows the quote
+/// (with "Play from …"); the context menu plays the recording directly.
+struct EvidenceChip: View {
+    let source: SummaryEvidenceSource
+    let onOpen: () -> Void
+    var onPlay: ((SummaryEvidenceSource) -> Void)? = nil
+
+    private var label: String { source.timestampText ?? "Transcript" }
+
+    var body: some View {
+        Button(action: onOpen) {
+            Label(label, systemImage: "text.quote")
+                .font(SekitiriType.label.monospacedDigit())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(SekitiriColor.terracotta)
+        .help(source.quote)
+        .accessibilityLabel("Show transcript source \(source.timestampText ?? "")")
+        .contextMenu {
+            Button("Show Source Quote", action: onOpen)
+            if let onPlay, source.timestampSeconds != nil {
+                Button("Play from \(label)") { onPlay(source) }
+            }
+        }
     }
 }

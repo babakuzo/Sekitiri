@@ -4,21 +4,30 @@ import Foundation
 /// One authoritative piece of the transcript, with extra audio on both sides
 /// for recognition context. Only words belonging to the core are committed.
 struct TranscriptionWindow: Codable, Equatable, Sendable {
-    static let coreDuration: TimeInterval = 26
-    static let contextDuration: TimeInterval = 2
+    /// Context plus core stays under Parakeet's 15 s encoder window, so each
+    /// window is decoded in one pass with no internal chunk seam.
+    static let coreDuration: TimeInterval = 12.9
+    static let contextDuration: TimeInterval = 1
+    /// Pause-aligned windows never end earlier than this.
+    static let minimumCore: TimeInterval = 6
+    /// Checkpoints written before pause-aligned windows used 26 s cores and
+    /// 2 s context; they remain valid and resumable.
+    static let legacyMaximumCore: TimeInterval = 26
+    static let legacyMaximumRead: TimeInterval = 30
     let coreStart: TimeInterval
     let coreEnd: TimeInterval
     let readStart: TimeInterval
     let readEnd: TimeInterval
 
-    static func next(after completed: TimeInterval, available: TimeInterval, final: Bool) -> Self? {
+    static func next(after completed: TimeInterval, available: TimeInterval, final: Bool,
+                     core: TimeInterval = coreDuration, context: TimeInterval = contextDuration) -> Self? {
         guard completed.isFinite, available.isFinite, completed >= 0,
               available - completed > 0.000_1 else { return nil }
-        let coreEnd = min(completed + coreDuration, available)
-        if !final && available + 0.000_1 < completed + coreDuration + contextDuration { return nil }
+        let coreEnd = min(completed + core, available)
+        if !final && available + 0.000_1 < completed + core + context { return nil }
         return Self(coreStart: completed, coreEnd: coreEnd,
-                    readStart: max(0, completed - contextDuration),
-                    readEnd: min(available, coreEnd + contextDuration))
+                    readStart: max(0, completed - context),
+                    readEnd: min(available, coreEnd + context))
     }
 }
 
@@ -119,10 +128,10 @@ struct TranscriptionCheckpoint: Codable {
                   window.readStart.isFinite, window.readEnd.isFinite,
                   abs(window.coreStart - end) < 0.000_1,
                   window.coreEnd > window.coreStart, window.coreEnd <= duration + 0.001,
-                  window.coreEnd - window.coreStart <= TranscriptionWindow.coreDuration + 0.001,
+                  window.coreEnd - window.coreStart <= TranscriptionWindow.legacyMaximumCore + 0.001,
                   window.readStart >= 0, window.readStart <= window.coreStart,
                   window.readEnd >= window.coreEnd, window.readEnd <= duration + 0.001,
-                  window.readEnd - window.readStart <= 30.001,
+                  window.readEnd - window.readStart <= TranscriptionWindow.legacyMaximumRead + 0.001,
                   Self.valid(entry.segments, in: window) else { return false }
             end = window.coreEnd
         }

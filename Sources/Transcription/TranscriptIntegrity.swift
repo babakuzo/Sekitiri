@@ -78,11 +78,29 @@ struct SpeakerSpan: Sendable {
 /// JSON is the canonical transcript. A separate commit record certifies that
 /// both it and readable Markdown were saved successfully for this generation.
 struct Transcript: Codable {
+    struct Word: Codable, Sendable, Equatable {
+        let text: String
+        let start_ms: Int
+        let end_ms: Int
+        var confidence: Float?
+    }
+
     struct Segment: Codable, Sendable {
         let speaker: String
         let start_ms: Int
         let end_ms: Int
         let text: String
+        /// Word timings and recognizer confidence. Absent in transcripts
+        /// written before words were retained.
+        var words: [Word]? = nil
+    }
+
+    /// Microphone text removed because it repeated what was simultaneously
+    /// heard on the system track (speaker playback picked up by the mic).
+    /// Kept for transparency; never shown in Markdown or summaries.
+    struct SuppressedSegment: Codable, Sendable {
+        let segment: Segment
+        let reason: String
     }
 
     struct TrackOutcome: Codable, Sendable {
@@ -99,6 +117,7 @@ struct Transcript: Codable {
     let segments: [Segment]
     var trackOutcomes: [TrackOutcome] = []
     var issues: [String] = []
+    var suppressedSegments: [SuppressedSegment] = []
     var generationID: String? = UUID().uuidString
     var schemaVersion: Int? = 2
 
@@ -106,18 +125,21 @@ struct Transcript: Codable {
         case engine, model, created_at, segments
         case trackOutcomes = "track_outcomes"
         case issues
+        case suppressedSegments = "suppressed_segments"
         case generationID = "generation_id"
         case schemaVersion = "schema_version"
     }
 
     init(engine: String, model: String, created_at: String, segments: [Segment],
-         trackOutcomes: [TrackOutcome] = [], issues: [String] = []) {
+         trackOutcomes: [TrackOutcome] = [], issues: [String] = [],
+         suppressedSegments: [SuppressedSegment] = []) {
         self.engine = engine
         self.model = model
         self.created_at = created_at
         self.segments = segments
         self.trackOutcomes = trackOutcomes
         self.issues = issues
+        self.suppressedSegments = suppressedSegments
     }
 
     init(from decoder: Decoder) throws {
@@ -128,6 +150,7 @@ struct Transcript: Codable {
         segments = try values.decode([Segment].self, forKey: .segments)
         trackOutcomes = try values.decodeIfPresent([TrackOutcome].self, forKey: .trackOutcomes) ?? []
         issues = try values.decodeIfPresent([String].self, forKey: .issues) ?? []
+        suppressedSegments = try values.decodeIfPresent([SuppressedSegment].self, forKey: .suppressedSegments) ?? []
         generationID = try values.decodeIfPresent(String.self, forKey: .generationID)
         schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion)
     }

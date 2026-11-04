@@ -1,11 +1,13 @@
-// swift-tools-version:6.0
+// swift-tools-version:6.2
 import PackageDescription
 
 let package = Package(
     name: "Sekitiri",
     platforms: [.macOS(.v15)],
     dependencies: [
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.7.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.18.0",
+                 // ASR, VAD and diarization only: drops TTS and the Rust text-normalisation binary.
+                 traits: ["Diarizer"]),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.0"),
@@ -22,7 +24,8 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources",
-            exclude: ["Info.plist"],
+            // Fonts are copied into Contents/Resources/Fonts by Tools/build_app.sh.
+            exclude: ["Info.plist", "Assets/Fonts"],
             resources: [.process("Assets")],
             linkerSettings: [
                 // Embed Info.plist so TCC attributes mic/system-audio permissions

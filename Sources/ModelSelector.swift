@@ -1,32 +1,48 @@
 import SwiftUI
 
 // ============================================================================
-// Model selector — pill button + grouped popover (Screen C).
+// Summary engines — all run on this Mac. A native menu picker is used
+// everywhere the engine can be changed.
 // ============================================================================
 
 struct ModelItem: Identifiable, Hashable {
     let id: String
-    let name: String           // display name
-    let group: ModelGroup
-    let provider: String
+    /// Plain-language name shown in pickers.
+    let name: String
+    /// One-line explanation shown in Settings.
+    let detail: String
     let spec: String
-
-    enum ModelGroup: String, CaseIterable, Identifiable {
-        case local = "LOCAL (ON-DEVICE)"
-        var id: String { rawValue }
-    }
 
     var engineSpec: String { spec }
 
     static func == (lhs: ModelItem, rhs: ModelItem) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
-    /// Built-in local summarizers. The MLX model is managed explicitly in
-    /// Settings; requesting a summary never starts a download.
-    static let sourceNotes = ModelItem(id: "source-notes", name: "Source notes · lightweight", group: .local, provider: "No language model", spec: "source-notes")
-    static let appleIntelligence = ModelItem(id: "afm", name: "Apple Foundation Model", group: .local, provider: "On-device", spec: "afm")
-    static let qwen35 = ModelItem(id: "qwen3.5-2b", name: "Qwen3.5 2B · 4-bit", group: .local, provider: "MLX local", spec: "qwen3.5-2b")
-    static let qwenSmall = ModelItem(id: "qwen3.5-0.8b", name: "Qwen3.5 0.8B · 4-bit (experimental)", group: .local, provider: "MLX local", spec: "qwen3.5-0.8b")
+    /// "1.75 GB" — the approximate one-time Qwen download.
+    static let qwenDownloadSize = ByteCountFormatter.string(
+        fromByteCount: LocalSummaryModel.qwen2B.approximateDownloadBytes, countStyle: .file
+    )
+
+    /// Built-in local summarizers. The MLX model is downloaded explicitly;
+    /// requesting a summary never starts a download.
+    static let sourceNotes = ModelItem(
+        id: "source-notes",
+        name: "Quick extract (no AI, instant)",
+        detail: "Keeps the transcript’s own sentences for decisions and tasks. Nothing to download.",
+        spec: "source-notes"
+    )
+    static let appleIntelligence = ModelItem(
+        id: "afm",
+        name: "Apple Intelligence",
+        detail: "Apple’s on-device model, built into macOS. Nothing to download.",
+        spec: "afm"
+    )
+    static let qwen35 = ModelItem(
+        id: "qwen3.5-2b",
+        name: "Qwen 3.5 (\(qwenDownloadSize) download)",
+        detail: "An open model that runs on this Mac after a one-time download.",
+        spec: "qwen3.5-2b"
+    )
 
     var localModel: LocalSummaryModel? { LocalSummaryModel(rawValue: spec) }
     var requiresDownload: Bool { localModel != nil }
@@ -44,115 +60,29 @@ extension ModelItem {
     }
 }
 
-// MARK: - Pill trigger (compact, used in toolbars)
+// MARK: - Picker
 
-struct ModelPill: View {
-    @Binding var selected: ModelItem
-    @State private var showPopover = false
-
-    var body: some View {
-        Button(action: { showPopover = true }) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(selected.group == .local ? Color.green : Color.accentColor)
-                    .frame(width: 8, height: 8)
-                Text(selected.name)
-                    .font(.system(.caption, weight: .semibold))
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9))
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(Color.accentColor)
-            .foregroundColor(.white)
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .popover(isPresented: $showPopover) {
-            ModelPopover(selected: $selected, isPresented: $showPopover, allModels: ModelItem.builtIns)
-                .frame(width: 340)
-        }
-    }
-}
-
-// MARK: - Popover (grouped list)
-
-struct ModelPopover: View {
-    @Binding var selected: ModelItem
-    @Binding var isPresented: Bool
-    let allModels: [ModelItem]
+/// Native menu picker for the summary engine, bound to the app model.
+struct SummaryEnginePicker: View {
+    @EnvironmentObject var model: AppModel
+    var showsLabel = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(ModelItem.ModelGroup.allCases) { group in
-                let models = allModels.filter { $0.group == group }
-
-                // Section header
-                Text(group.rawValue)
-                    .font(.system(.caption2, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .textCase(.uppercase)
-                    .padding(.horizontal, 14)
-                    .padding(.top, group == ModelItem.ModelGroup.allCases.first ? 10 : 14)
-                    .padding(.bottom, 6)
-
-                ForEach(models) { model in
-                    Button(action: {
-                        selected = model
-                        isPresented = false
-                    }) {
-                        HStack(spacing: 10) {
-                            // Selection circle
-                            Circle()
-                                .fill(selected.id == model.id ? Color.accentColor : Color.gray.opacity(0.3))
-                                .frame(width: 16, height: 16)
-                                .overlay(
-                                    Image(systemName: "checkmark")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundColor(.white)
-                                        .opacity(selected.id == model.id ? 1 : 0)
-                                )
-
-                            Text(model.name)
-                                .font(.system(.body))
-                                .foregroundColor(.primary)
-
-                            Spacer()
-
-                            // Provider tag
-                            Text(model.provider)
-                                .font(.system(.caption2, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(providerColor(model.provider))
-                                .clipShape(Capsule())
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(selected.id == model.id
-                                    ? Color.accentColor.opacity(0.1)
-                                    : Color.clear)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
+        Picker("Summary engine", selection: $model.selectedModel) {
+            ForEach(ModelItem.builtIns) { item in
+                Text(item.name).tag(item)
             }
-
-            Divider()
-                .padding(.top, 8)
-
-            // Privacy note
-            Text("Local models process completely off-network.")
-                .font(.system(.caption))
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
         }
-        .padding(.vertical, 4)
+        .pickerStyle(.menu)
+        .modifier(HiddenLabel(hidden: !showsLabel))
+        .disabled(model.isSummarizing || model.localSummaryModelState.isBusy)
+        .help("Choose how notes are generated. Everything runs on this Mac.")
     }
 
-    private func providerColor(_ provider: String) -> Color {
-        provider == "On-device" ? .gray : SekitiriColor.terracotta
+    private struct HiddenLabel: ViewModifier {
+        let hidden: Bool
+        func body(content: Content) -> some View {
+            if hidden { content.labelsHidden().fixedSize() } else { content }
+        }
     }
 }

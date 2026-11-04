@@ -28,10 +28,6 @@ final class MicRecorder: @unchecked Sendable {
     /// Low-bandwidth activity signal used by the meeting auto-end policy.
     /// It carries only a boolean and never exposes audio samples.
     var onAudioActivity: ((Bool) -> Void)?
-    /// Receives copied mono PCM chunks for live transcription. The callback is
-    /// invoked from the audio tap after the samples have been copied, so
-    /// consumers must enqueue work and return quickly.
-    var onLiveAudioChunk: (@Sendable (LiveAudioChunk) -> Void)?
     enum RecorderError: Error, CustomStringConvertible {
         case engineStartFailed(Error)
         case fileCreationFailed(Error)
@@ -272,7 +268,6 @@ final class MicRecorder: @unchecked Sendable {
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             guard let self, !self.captureWriteFailed, buffer.frameLength > 0, let writer = self.writer else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
-            self.emitLiveAudioChunk(from: buffer, sampleRate: format.sampleRate)
             self.reportAudioActivity(from: buffer)
 
             if !self.livenessSettled {
@@ -331,7 +326,6 @@ final class MicRecorder: @unchecked Sendable {
             }
             do {
                 try converter.convert(to: mono, from: buffer)
-                self.emitLiveAudioChunk(from: mono, sampleRate: monoFormat.sampleRate)
                 self.reportAudioActivity(from: mono)
                 try writer.write(from: mono)
             } catch is CancellationError where !self.isRecording {
@@ -365,13 +359,6 @@ final class MicRecorder: @unchecked Sendable {
         DispatchQueue.main.async { [weak self] in
             self?.onAudioActivity?(active)
         }
-    }
-
-    private func emitLiveAudioChunk(from buffer: AVAudioPCMBuffer, sampleRate: Double) {
-        guard onLiveAudioChunk != nil else { return }
-        guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
-        let copied = Array(UnsafeBufferPointer(start: samples, count: Int(buffer.frameLength)))
-        onLiveAudioChunk?(LiveAudioChunk(samples: copied, sampleRate: sampleRate))
     }
 
     /// The voice-processing route delivered a full second of digital silence:

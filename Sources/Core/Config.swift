@@ -42,19 +42,47 @@ enum Config {
         transcription()?["enabled"] as? Bool ?? true
     }
 
-    /// Configured final-pass engine. `parakeet-v3` is the multilingual default;
-    /// `parakeet` remains available as the English-focused v2 fallback.
+    /// Configured engine. An explicit choice always wins. Otherwise Parakeet
+    /// Ultra (more accurate than v3 at the same speed) is used on fresh
+    /// installs; Macs that already hold v3 keep it until the user upgrades in
+    /// Settings, so the next meeting never waits on a surprise download.
     static func transcriptionEngine() -> String {
-        UserDefaults.standard.string(forKey: "localTranscriptionEngine")
-            ?? transcription()?["engine"] as? String
-            ?? "parakeet-v3"
+        if let explicit = UserDefaults.standard.string(forKey: "localTranscriptionEngine")
+            ?? transcription()?["engine"] as? String {
+            return explicit
+        }
+        if ParakeetEngine.isCached(engine: "parakeet-ultra") || !ParakeetEngine.isCached(engine: "parakeet-v3") {
+            return "parakeet-ultra"
+        }
+        return "parakeet-v3"
     }
 
-    /// Language mode for the next recording. Auto keeps the full multilingual
-    /// model and lets it identify the spoken language; explicit regional codes
-    /// constrain recognition; Auto and Multilingual keep code-switching available.
+    /// Language for the next recording. Parakeet identifies the language on
+    /// its own and handles English/French switching; the only available hint
+    /// filters by alphabet and measurably hurts mixed-language meetings
+    /// (FluidAudio #840), so new recordings always use automatic detection.
+    /// Sessions recorded earlier keep the language saved with them.
     static func transcriptionLanguage() -> String {
-        UserDefaults.standard.string(forKey: "transcriptionLanguage") ?? "auto"
+        "auto"
+    }
+
+    /// Terms the recognizer should favour: the user's glossary (one term per
+    /// line or comma-separated) plus meeting attendees' names. Email addresses
+    /// and terms under three characters are skipped; the list is capped to
+    /// keep rescoring fast and precise.
+    static func transcriptionVocabulary(attendees: [String] = []) -> [String] {
+        let glossary = UserDefaults.standard.string(forKey: "transcriptionVocabulary") ?? ""
+        var terms = glossary.components(separatedBy: CharacterSet(charactersIn: ",\n"))
+        for attendee in attendees where !attendee.contains("@") {
+            terms.append(attendee)
+            terms += attendee.split(separator: " ").map(String.init)
+        }
+        var seen = Set<String>()
+        return terms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count >= 3 && !$0.contains("@") && seen.insert($0.lowercased()).inserted }
+            .prefix(200)
+            .map { $0 }
     }
 
     /// Split the mixed system-audio track into stable speaker slots after
@@ -71,13 +99,32 @@ enum Config {
         load()?["transcription"] as? [String: Any]
     }
 
+    enum EchoCancellation: String, CaseIterable, Identifiable {
+        case automatic = "auto"
+        case on
+        case off
+        var id: String { rawValue }
+    }
+
+    /// The echo cancellation preference: Settings first, then the config
+    /// file's `mic_voice_processing`, otherwise automatic.
+    static func echoCancellation() -> EchoCancellation {
+        if let raw = UserDefaults.standard.string(forKey: "echoCancellation"),
+           let mode = EchoCancellation(rawValue: raw) { return mode }
+        if let legacy = load()?["mic_voice_processing"] as? Bool { return legacy ? .on : .off }
+        return .automatic
+    }
+
     /// Apple voice processing (acoustic echo cancellation) on the mic, so
     /// speaker playback doesn't bleed into the mic track and get transcribed
-    /// as "me". Default off — the live voice unit ducks all other playback,
-    /// and on headphones there's no echo to cancel anyway. Set true when
-    /// recording meetings through the speakers.
+    /// as "me". Automatic mode enables it only when the output is not
+    /// headphones; ducking of other audio is minimised in MicRecorder.
     static func micVoiceProcessing() -> Bool {
-        load()?["mic_voice_processing"] as? Bool ?? false
+        switch echoCancellation() {
+        case .on: return true
+        case .off: return false
+        case .automatic: return !AudioOutputRoute.isPrivateListening()
+        }
     }
 
     /// Parse the config file. A malformed config is reported on stderr rather
@@ -109,36 +156,27 @@ enum Config {
     }
 }
 
-enum TranscriptionLanguageOption: String, CaseIterable, Identifiable {
-    case auto = "auto"
-    case multilingual = "multilingual"
-    case english = "en-US"
-    case french = "fr-FR"
-    case spanish = "es-ES"
-    case german = "de-DE"
-    case italian = "it-IT"
-    case portuguese = "pt-BR"
+/// Transcription engines offered in Settings, most recommended first.
+enum TranscriptionEngineOption: String, CaseIterable, Identifiable {
+    case ultra = "parakeet-ultra"
+    case v3 = "parakeet-v3"
+    case englishOnly = "parakeet"
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .auto: return "Auto-detect"
-        case .multilingual: return "Multilingual"
-        case .english: return "English"
-        case .french: return "French"
-        case .spanish: return "Spanish"
-        case .german: return "German"
-        case .italian: return "Italian"
-        case .portuguese: return "Portuguese"
+        case .ultra: return "Best accuracy (recommended)"
+        case .v3: return "Standard"
+        case .englishOnly: return "English only"
         }
     }
 
     var detail: String {
         switch self {
-        case .auto: return "Detect the spoken language automatically"
-        case .multilingual: return "Keep supported languages available, including mixed English and French"
-        default: return "Use the selected language for local recognition; choose Multilingual for mixed-language meetings"
+        case .ultra: return "25 languages, including mixed English and French. About 630 MB, downloaded once."
+        case .v3: return "25 languages. The previous default model."
+        case .englishOnly: return "English meetings only."
         }
     }
 }

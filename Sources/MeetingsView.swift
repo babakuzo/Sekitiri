@@ -3,351 +3,651 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 // ============================================================================
-// Screen B — Meetings archive. Left: searchable list. Right: detail with
-// structured summary sections + raw transcript + re-summarize button.
+// Meetings — searchable archive grouped by date, and a meeting page with the
+// structured summary, a seekable transcript and a pinned audio player.
 // ============================================================================
 
-struct MeetingsScreenView: View {
-    @EnvironmentObject var model: AppModel
-    @Binding var requestedMeetingID: String?
-    @State private var items: [MeetingItem] = []
-    @State private var selected: MeetingItem?
+// MARK: - Meeting model
 
-    var body: some View {
-        Group {
-            if let selected {
-                MeetingDetailView(item: selected)
-                    .environmentObject(model)
-                    .background(SekitiriColor.canvas)
-            } else {
-                GeometryReader { proxy in
-                    let showSchedule = proxy.size.width >= 980
-                    HStack(spacing: 0) {
-                        MeetingArchiveView(items: items) { selected = $0 }
-                        if showSchedule {
-                            TodaySchedulePanel(start: { model.start() })
-                                .environmentObject(model)
-                                .frame(width: 300)
-                        }
-                    }
-                }
-            }
+enum MeetingStatus: Equatable, Sendable {
+    case transcribing
+    case needsAttention
+    case transcriptReady
+    case notesReady
+    case actionsPending
+
+    var title: String {
+        switch self {
+        case .transcribing: return "Transcribing"
+        case .needsAttention: return "Needs attention"
+        case .transcriptReady: return "Transcript ready"
+        case .notesReady: return "Notes ready"
+        case .actionsPending: return "Action items pending"
         }
-        .onAppear {
-            load()
-            openRequestedMeetingIfNeeded()
-        }
-        .onChange(of: requestedMeetingID) { _, _ in openRequestedMeetingIfNeeded() }
     }
 
-    private func load() {
-        let vault = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Meetings")
+    var kind: SekitiriStatusKind {
+        switch self {
+        case .transcribing: return .active
+        case .needsAttention: return .warning
+        case .transcriptReady: return .waiting
+        case .notesReady: return .ready
+        case .actionsPending: return .pending
+        }
+    }
+}
+
+struct MeetingItem: Identifiable, Sendable {
+    let id: String
+    let url: URL
+    let title: String
+    let engine: String
+    let durationSeconds: Int?
+    let date: Date?
+    let participants: [String]
+    let sourceSession: URL?
+    let status: MeetingStatus
+    let excerpt: String
+    /// Lower-cased title, participants and summary text for search.
+    let searchText: String
+
+    /// The capture folder when it still exists, else the vault folder.
+    var workingDirectory: URL { sourceSession ?? url }
+
+    var duration: String {
+        guard let durationSeconds, durationSeconds > 0 else { return "" }
+        let minutes = max(1, Int((Double(durationSeconds) / 60).rounded()))
+        return minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes) min"
+    }
+
+    /// Recordings are stored in the source session; older imported meetings
+    /// may also have their tracks directly beside the canonical note files.
+    /// Reads the disk — call once when a meeting opens, not from `body`.
+    func loadRecordingTrackURLs() -> [URL] {
+        let roots = [sourceSession, url].compactMap { $0 }
+        var seen = Set<String>()
+        return roots.flatMap { root in
+            ["mic.caf", "system.caf"].map { root.appendingPathComponent($0) }
+        }.filter { candidate in
+            guard FileManager.default.fileExists(atPath: candidate.path), !seen.contains(candidate.path) else { return false }
+            seen.insert(candidate.path)
+            return true
+        }
+    }
+
+    var engineShort: String {
+        switch engine {
+        case "source-notes": return "Quick extract"
+        case "afm": return "Apple Intelligence"
+        case "qwen3.5-2b": return "Qwen 3.5 2B"
+        case "qwen3.5-0.8b": return "Qwen 3.5 0.8B"
+        case "qwen3-4b": return "Qwen 3 4B"
+        case "gemma3n-e2b": return "Gemma 3n E2B"
+        default: return engine.isEmpty ? "Local" : engine
+        }
+    }
+
+    var dateString: String {
+        guard let date else { return id }
+        return date.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    var metadataLine: String {
+        [dateString, duration.isEmpty ? nil : duration].compactMap { $0 }.joined(separator: " · ")
+    }
+}
+
+/// Reads meetings from the notes vault and the recordings folder. All disk
+/// work happens here, off the main actor, so views never touch the disk in
+/// `body`.
+enum MeetingLibrary {
+    enum RenameError: Error { case noMetadata }
+
+    /// Writes `title_override` into the metadata file the library reads for
+    /// this meeting: the note folder's meta.json, else the capture's.
+    static func rename(_ item: MeetingItem, to title: String) throws {
+        let candidates = [item.url.appendingPathComponent("meta.json")]
+            + (item.sourceSession.map { [$0.appendingPathComponent("meta.json")] } ?? [])
+        guard let metaURL = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            throw RenameError.noMetadata
+        }
+        var meta = try JSONSerialization.jsonObject(with: Data(contentsOf: metaURL)) as? [String: Any] ?? [:]
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { meta.removeValue(forKey: "title_override") } else { meta["title_override"] = trimmed }
+        let data = try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: metaURL, options: .atomic)
+    }
+
+    static func load(limit: Int? = nil) async -> [MeetingItem] {
+        let vault = MeetingNotesService.meetingsDirectory()
+        let recordings = AppModel.recordingsRoot()
+        return await Task.detached(priority: .userInitiated) {
+            let items = build(vault: vault, recordingsRoot: recordings)
+            return limit.map { Array(items.prefix($0)) } ?? items
+        }.value
+    }
+
+    private static func build(vault: URL, recordingsRoot: URL) -> [MeetingItem] {
+        let fm = FileManager.default
         let index = (try? Data(contentsOf: vault.appendingPathComponent(".index.json")))
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         let indexedMeetings = index?["meetings"] as? [[String: Any]] ?? []
-        let entries = (try? FileManager.default.contentsOfDirectory(
-            at: vault, includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey]
-        )) ?? []
+        let vaultEntries = (try? fm.contentsOfDirectory(at: vault, includingPropertiesForKeys: nil)) ?? []
 
-        var loaded = entries
-            .filter { $0.lastPathComponent.hasPrefix("20") }
-            .compactMap { url -> MeetingItem? in
+        var items: [MeetingItem] = vaultEntries
+            .filter { $0.lastPathComponent.hasPrefix("20") && isDirectory($0) }
+            .map { url in
                 let folder = url.lastPathComponent
-                let summaryURL = url.appendingPathComponent("summary.md")
-                let transcriptURL = url.appendingPathComponent("transcript.diarized.md")
-                let plainTranscriptURL = url.appendingPathComponent("transcript.md")
-
-                let summary = (try? String(contentsOf: summaryURL, encoding: .utf8)) ?? ""
-                let title = Self.extractTitle(from: summary) ?? folder
-                let engine = Self.extractEngine(from: summary)
-                let duration = Self.estimateDuration(transcriptURL: transcriptURL, fallback: plainTranscriptURL)
-                let date = Self.parseDate(from: folder)
-                let source = (try? Data(contentsOf: url.appendingPathComponent("source.json")))
-                    .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                let meta = (try? Data(contentsOf: url.appendingPathComponent("meta.json")))
-                    .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                let override = meta?["title_override"] as? String
-                let participants = source?["attendees"] as? [String] ?? meta?["attendees"] as? [String] ?? []
                 let sourceSession = (indexedMeetings.first(where: { ($0["id"] as? String) == folder })?["sourceSessionDir"] as? String)
                     .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-
-                return MeetingItem(
-                    id: folder,
-                    url: url,
-                    title: override?.isEmpty == false ? override! : title,
-                    engine: engine,
-                    duration: duration,
-                    date: date,
-                    participants: participants,
-                    sourceSession: sourceSession
-                )
+                    .flatMap { fm.fileExists(atPath: $0.path) ? $0 : nil }
+                return makeItem(id: folder, url: url, sourceSession: sourceSession)
             }
-        let indexedSessionPaths = Set(loaded.compactMap(\.sourceSession).map(\.path))
-        let recordings = (try? FileManager.default.contentsOfDirectory(at: AppModel.recordingsRoot(), includingPropertiesForKeys: nil)) ?? []
-        loaded += recordings.compactMap { directory -> MeetingItem? in
-            guard !indexedSessionPaths.contains(directory.path),
-                  let data = try? Data(contentsOf: directory.appendingPathComponent("meta.json")),
-                  let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            let title = (meta["title_override"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return MeetingItem(
-                id: directory.lastPathComponent,
-                url: directory,
-                title: title?.isEmpty == false ? title! : "Untitled meeting",
-                engine: "",
-                duration: "",
-                date: Self.parseDate(from: directory.lastPathComponent),
-                participants: meta["attendees"] as? [String] ?? [],
-                sourceSession: directory
-            )
+        let indexedSessionPaths = Set(items.compactMap(\.sourceSession).map(\.standardizedFileURL.path))
+        let recordingEntries = (try? fm.contentsOfDirectory(at: recordingsRoot, includingPropertiesForKeys: nil)) ?? []
+        items += recordingEntries.compactMap { directory -> MeetingItem? in
+            guard !indexedSessionPaths.contains(directory.standardizedFileURL.path),
+                  fm.fileExists(atPath: directory.appendingPathComponent("meta.json").path) else { return nil }
+            return makeItem(id: directory.lastPathComponent, url: directory, sourceSession: directory)
         }
-        items = loaded.sorted { $0.id > $1.id }
+        return items.sorted { ($0.date ?? .distantPast, $0.id) > ($1.date ?? .distantPast, $1.id) }
     }
 
-    private func openRequestedMeetingIfNeeded() {
-        guard let requestedMeetingID, let item = items.first(where: { $0.id == requestedMeetingID }) else { return }
-        selected = item
-        self.requestedMeetingID = nil
-    }
+    private static func makeItem(id: String, url: URL, sourceSession: URL?) -> MeetingItem {
+        let fm = FileManager.default
+        let source = sourceSession ?? url
+        let localMeta = json(url.appendingPathComponent("meta.json"))
+        let sourceMeta = json(url.appendingPathComponent("source.json")) ?? json(source.appendingPathComponent("meta.json"))
+        let meta = localMeta ?? sourceMeta
 
-    private static func extractTitle(from summary: String) -> String? {
-        // First line after frontmatter: "# Title"
-        let lines = summary.components(separatedBy: .newlines)
-        var pastFrontmatter = false
-        for line in lines {
-            if line.trimmingCharacters(in: .whitespaces) == "---" {
-                pastFrontmatter.toggle(); continue
-            }
-            if pastFrontmatter || !line.hasPrefix("---") {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.hasPrefix("# ") {
-                    return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
-                }
-                if !trimmed.isEmpty { return trimmed }
-            }
+        let legacySummary = (try? String(contentsOf: url.appendingPathComponent("summary.md"), encoding: .utf8)) ?? ""
+        let document = try? SummaryDocumentStore.load(from: url)
+        let summary = document.map { CanonicalSummaryBuilder.markdown(from: $0) } ?? legacySummary
+        let hasSummary = !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        let transcriptNames = ["transcript.md", "transcript.diarized.md", "transcript.json"]
+        let hasTranscript = [url, source].contains { directory in
+            transcriptNames.contains { fm.fileExists(atPath: directory.appendingPathComponent($0).path) }
         }
-        return nil
+        let modern = fm.fileExists(atPath: source.appendingPathComponent("transcription-settings.json").path)
+
+        let status: MeetingStatus
+        let excerpt: String
+        if hasTranscript, modern, !TranscriptIntegrity.isComplete(at: source) {
+            status = .needsAttention
+            excerpt = "Some audio couldn’t be transcribed. Open the meeting to check the recording and retry."
+        } else if hasSummary {
+            let hasOpenActions = document.map { doc in
+                doc.actionItems.contains { !$0.isCompleted && !OpenActionItem.isPlaceholder($0.text) }
+            } ?? SummaryParser.hasPendingActions(summary)
+            status = hasOpenActions ? .actionsPending : .notesReady
+            excerpt = oneLineSummary(from: summary)
+        } else if hasTranscript {
+            status = .transcriptReady
+            excerpt = "Transcript saved. Open the meeting to create notes and action items."
+        } else if let log = try? String(contentsOf: source.appendingPathComponent("transcribe.log"), encoding: .utf8),
+                  log.localizedCaseInsensitiveContains("transcription failed") {
+            status = .needsAttention
+            excerpt = "Transcription needs attention. Your recording is preserved."
+        } else {
+            status = .transcribing
+            excerpt = "Your recording is saved and being transcribed."
+        }
+
+        let override = (meta?["title_override"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let recordedTitle = (meta?["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = [override, recordedTitle, markdownTitle(in: summary)]
+            .compactMap { $0 }
+            .first { !$0.isEmpty } ?? "Untitled meeting"
+        let participants = meta?["attendees"] as? [String] ?? []
+        let date = (meta?["started"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) } ?? parseDate(from: id)
+        let duration = meta?["duration_seconds"] as? Int
+
+        return MeetingItem(
+            id: id,
+            url: url,
+            title: title,
+            engine: engine(in: legacySummary),
+            durationSeconds: duration,
+            date: date,
+            participants: participants,
+            sourceSession: sourceSession,
+            status: status,
+            excerpt: excerpt,
+            searchText: ([title] + participants + [summary]).joined(separator: "\n").lowercased()
+        )
     }
 
-    private static func extractEngine(from summary: String) -> String {
-        // Frontmatter: engine: afm
-        for line in summary.components(separatedBy: .newlines) {
+    private static func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+    }
+
+    private static func json(_ url: URL) -> [String: Any]? {
+        (try? Data(contentsOf: url)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    }
+
+    private static func markdownTitle(in summary: String) -> String? {
+        summary.components(separatedBy: .newlines)
+            .first { $0.hasPrefix("# ") }
+            .map { String($0.dropFirst(2)).trimmingCharacters(in: .whitespaces) }
+    }
+
+    private static func engine(in summary: String) -> String {
+        for line in summary.components(separatedBy: .newlines).prefix(30) {
             let t = line.trimmingCharacters(in: .whitespaces)
             if t.hasPrefix("engine:") {
-                let val = String(t.dropFirst(7)).trimmingCharacters(in: .whitespaces)
-                return val.components(separatedBy: "|").first ?? val
+                let value = String(t.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+                return value.components(separatedBy: "|").first ?? value
             }
         }
         return ""
     }
 
-    private static func estimateDuration(transcriptURL: URL, fallback: URL) -> String {
-        let path = FileManager.default.fileExists(atPath: transcriptURL.path) ? transcriptURL : fallback
-        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return "" }
-        // Count timestamp entries like [00:05] or [01:23:45]
-        let regex = try? NSRegularExpression(pattern: "\\[(\\d{1,2}):(\\d{2})(?::(\\d{2}))?\\]")
-        let matches = regex?.matches(in: text, range: NSRange(text.startIndex..., in: text)) ?? []
-        guard let last = matches.last, let range = Range(last.range, in: text) else { return "" }
-        let parts = String(text[range]).drop { $0 == "[" }.dropLast()
-            .split(separator: ":")
-        let mins = Int(parts.count == 3 ? parts[1] : parts[0]) ?? 0
-        let secs = Int(parts.count == 3 ? parts[2] : parts[1]) ?? 0
-        if parts.count == 3, let h = Int(parts[0]) {
-            return "\(h)h \(mins)m"
-        }
-        return "\(mins + (secs > 0 ? 1 : 0)) min"
-    }
-
-    private static func parseDate(from folder: String) -> Date? {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy.MM.dd-HHmm"
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        return fmt.date(from: folder)
-    }
-}
-
-private struct MeetingArchiveView: View {
-    let items: [MeetingItem]
-    let open: (MeetingItem) -> Void
-
-    var body: some View {
-        GeometryReader { proxy in
-            let columnCount = proxy.size.width >= 690 ? 3 : (proxy.size.width >= 440 ? 2 : 1)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("Your meeting history")
-                        .font(SekitiriType.display(23))
-                        .foregroundStyle(SekitiriColor.terracotta)
-                    Text("All Your Meetings")
-                        .font(SekitiriType.display(44))
-                        .padding(.top, 4)
-
-                    if items.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Your meeting library is ready.")
-                                .font(SekitiriType.display(25))
-                            Text("Record a meeting to keep its transcript, summary, action items, and your additional notes together here.")
-                                .font(SekitiriType.body(14))
-                                .foregroundStyle(SekitiriColor.muted)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .padding(.top, 66)
-                    } else {
-                        Divider().overlay(SekitiriColor.line).padding(.top, 122)
-                        LazyVGrid(
-                            columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: columnCount),
-                            spacing: 0
-                        ) {
-                            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                                ArchiveMeetingCell(item: item) { open(item) }
-                                    .padding(.horizontal, 36)
-                                    .padding(.vertical, 18)
-                                    .frame(minHeight: 190, alignment: .topLeading)
-                                    .overlay(alignment: .leading) {
-                                        if index % columnCount != 0 {
-                                            Rectangle().fill(SekitiriColor.line).frame(width: 1)
-                                        }
-                                    }
-                                    .overlay(alignment: .top) {
-                                        if index >= columnCount {
-                                            Rectangle().fill(SekitiriColor.line).frame(height: 1)
-                                        }
-                                    }
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, proxy.size.width < 500 ? 24 : 36)
-                .padding(.top, 46)
-                .padding(.bottom, 56)
-            }
-        }
-        .background(SekitiriColor.canvas)
-    }
-}
-
-private struct ArchiveMeetingCell: View {
-    let item: MeetingItem
-    let action: () -> Void
-
-    private var presentation: MeetingArchivePresentation { MeetingArchivePresentation(item: item) }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(presentation.status)
-                .font(SekitiriType.body(10, weight: .medium))
-                .foregroundStyle(SekitiriColor.terracotta)
-            Text(item.title)
-                .font(SekitiriType.display(25))
-                .lineLimit(2)
-            Text(presentation.description)
-                .font(SekitiriType.body(12))
-                .foregroundStyle(SekitiriColor.muted)
-                .lineLimit(3)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 4)
-            Button("Open notes", action: action)
-                .font(SekitiriType.body(11, weight: .medium))
-                .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(SekitiriColor.terracotta, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-}
-
-private struct MeetingArchivePresentation {
-    let status: String
-    let description: String
-
-    init(item: MeetingItem) {
-        let legacySummary = (try? String(contentsOf: item.url.appendingPathComponent("summary.md"), encoding: .utf8)) ?? ""
-        let document = try? SummaryDocumentStore.load(from: item.url)
-        let summary = document.map { CanonicalSummaryBuilder.markdown(from: $0) } ?? legacySummary
-        let fileManager = FileManager.default
-        let hasSummary = !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasTranscript = fileManager.fileExists(atPath: item.url.appendingPathComponent("transcript.diarized.md").path)
-            || fileManager.fileExists(atPath: item.url.appendingPathComponent("transcript.md").path)
-            || fileManager.fileExists(atPath: (item.sourceSession ?? item.url).appendingPathComponent("transcript.diarized.md").path)
-            || fileManager.fileExists(atPath: (item.sourceSession ?? item.url).appendingPathComponent("transcript.md").path)
-
-        if hasSummary {
-            status = Self.hasUncheckedActions(in: summary) ? "Action Items Pending" : "Summary ready"
-            description = Self.oneLineSummary(from: summary)
-        } else if hasTranscript {
-            status = "Summary pending"
-            description = Self.metadata(for: item, fallback: "Your transcript is ready. A summary can be generated when you’re ready.")
-        } else {
-            status = "Transcription ongoing"
-            description = Self.metadata(for: item, fallback: "Your recording is safely saved and is being transcribed.")
-        }
-    }
-
-    private static func metadata(for item: MeetingItem, fallback: String) -> String {
-        let parts = [item.dateString, item.duration.isEmpty ? nil : item.duration].compactMap { $0 }
-        return parts.isEmpty ? fallback : parts.joined(separator: " · ")
-    }
-
     private static func oneLineSummary(from markdown: String) -> String {
-        let headings = ["## At a glance", "## Key Takeaway", "## Summary"]
-        for heading in headings {
+        for heading in ["## At a glance", "## Key Takeaway", "## Summary"] {
             guard let range = markdown.range(of: heading, options: .caseInsensitive) else { continue }
             let paragraph = String(markdown[range.upperBound...])
                 .components(separatedBy: .newlines)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty && !$0.hasPrefix("#") && !$0.hasPrefix("-") }
-            if let paragraph, !paragraph.isEmpty { return truncate(paragraph) }
+            if let paragraph, !paragraph.isEmpty {
+                return paragraph.count > 155 ? String(paragraph.prefix(152)) + "…" : paragraph
+            }
         }
-        return "Your meeting summary is ready to review."
+        return "Your meeting notes are ready to review."
     }
 
-    private static func hasUncheckedActions(in markdown: String) -> Bool {
-        SummaryParser.hasPendingActions(markdown)
-    }
-
-    private static func truncate(_ text: String) -> String {
-        text.count > 155 ? String(text.prefix(152)) + "…" : text
+    private static func parseDate(from folder: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy.MM.dd-HHmm"
+        if let date = formatter.date(from: String(folder.prefix(15))) { return date }
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: String(folder.prefix(10)))
     }
 }
 
-// MARK: - Meeting card
+// MARK: - Screen
 
-struct MeetingCard: View {
-    let item: MeetingItem
-    let isSelected: Bool
+struct MeetingsScreenView: View {
+    @EnvironmentObject var model: AppModel
+    @Binding var selectedMeetingID: String?
+    @State private var items: [MeetingItem] = []
+    @State private var hasLoaded = false
+    @State private var query = ""
+    @State private var filter: ArchiveFilter = .all
+    @State private var person: String?
+    @State private var renaming: MeetingItem?
+    @State private var renameText = ""
+
+    private var selectedItem: MeetingItem? {
+        guard let selectedMeetingID else { return nil }
+        return items.first { $0.id == selectedMeetingID || $0.sourceSession?.lastPathComponent == selectedMeetingID }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(item.dateString)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundColor(isSelected ? .white.opacity(0.7) : .secondary)
-                Spacer(minLength: 4)
-                if !item.engine.isEmpty {
-                    Text(item.engineShort)
-                        .font(.system(.caption2, weight: .bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.8))
-                        .clipShape(Capsule())
+        Group {
+            if let item = selectedItem {
+                MeetingDetailView(item: item, onBack: { selectedMeetingID = nil })
+                    .id(item.id)
+            } else if selectedMeetingID != nil && !hasLoaded {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                SKRailLayout {
+                    MeetingArchiveView(
+                        allItems: items,
+                        items: filteredItems,
+                        query: $query,
+                        filter: $filter,
+                        isFiltering: !query.trimmingCharacters(in: .whitespaces).isEmpty || filter != .all || person != nil,
+                        open: { selectedMeetingID = $0.id },
+                        rename: { item in
+                            renameText = item.title == "Untitled meeting" ? "" : item.title
+                            renaming = item
+                        },
+                        delete: { item in
+                            if let session = item.sourceSession, model.deleteMeeting(session: session) {
+                                items.removeAll { $0.id == item.id }
+                            }
+                        }
+                    )
+                } rail: {
+                    PeopleRail(items: items, selected: $person)
                 }
             }
-            Text(item.title)
-                .font(.system(.body, weight: .semibold))
-                .foregroundColor(isSelected ? .white : .primary)
-                .lineLimit(2)
-            if !item.duration.isEmpty {
-                Text(item.duration)
-                    .font(.system(.caption2))
-                    .foregroundColor(isSelected ? .white.opacity(0.6) : .secondary)
+        }
+        .task(id: model.archiveRevision) {
+            items = await MeetingLibrary.load()
+            hasLoaded = true
+        }
+        .alert(
+            "Rename meeting",
+            isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+        ) {
+            TextField("Meeting name", text: $renameText)
+            Button("Rename") {
+                if let item = renaming { model.renameMeeting(item, to: renameText) }
+                renaming = nil
+            }
+            Button("Cancel", role: .cancel) { renaming = nil }
+        } message: {
+            Text("Leave it empty to go back to the original name.")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .sekitiriSnapshotOpenMeeting)) { _ in
+            selectedMeetingID = (items.first { $0.status == .actionsPending || $0.status == .notesReady } ?? items.first)?.id
+        }
+    }
+
+    private var filteredItems: [MeetingItem] {
+        let terms = query.lowercased().split(separator: " ").map(String.init)
+        return items.filter { item in
+            guard filter.includes(item) else { return false }
+            if let person, !item.participants.contains(person) { return false }
+            return terms.allSatisfy { item.searchText.contains($0) }
+        }
+    }
+}
+
+enum ArchiveFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case openActions = "With Open Actions"
+    case needsAttention = "Needs Attention"
+
+    var id: String { rawValue }
+
+    func includes(_ item: MeetingItem) -> Bool {
+        switch self {
+        case .all: return true
+        case .openActions: return item.status == .actionsPending
+        case .needsAttention: return item.status == .needsAttention
+        }
+    }
+}
+
+private struct MeetingGroup: Identifiable {
+    let title: String
+    let items: [MeetingItem]
+    var id: String { title }
+
+    static func grouped(_ items: [MeetingItem], now: Date = Date()) -> [MeetingGroup] {
+        let calendar = Calendar.current
+        let weekAgo = calendar.date(byAdding: .day, value: -7, to: calendar.startOfDay(for: now)) ?? now
+        var buckets: [(String, [MeetingItem])] = [("Today", []), ("Yesterday", []), ("Earlier This Week", []), ("Earlier", [])]
+        for item in items {
+            let index: Int
+            if let date = item.date, calendar.isDateInToday(date) { index = 0 }
+            else if let date = item.date, calendar.isDateInYesterday(date) { index = 1 }
+            else if let date = item.date, date >= weekAgo { index = 2 }
+            else { index = 3 }
+            buckets[index].1.append(item)
+        }
+        return buckets.filter { !$0.1.isEmpty }.map { MeetingGroup(title: $0.0, items: $0.1) }
+    }
+}
+
+private struct MeetingArchiveView: View {
+    @EnvironmentObject var model: AppModel
+    let allItems: [MeetingItem]
+    let items: [MeetingItem]
+    @Binding var query: String
+    @Binding var filter: ArchiveFilter
+    let isFiltering: Bool
+    let open: (MeetingItem) -> Void
+    let rename: (MeetingItem) -> Void
+    let delete: (MeetingItem) -> Void
+    @FocusState private var searchFocused: Bool
+
+    private var summaryLine: String {
+        let count = allItems.count
+        let seconds = allItems.compactMap(\.durationSeconds).reduce(0, +)
+        let hours = Double(seconds) / 3600
+        let recorded = hours >= 1 ? "\(Int(hours.rounded())) \(Int(hours.rounded()) == 1 ? "hour" : "hours") recorded"
+                                  : "\(max(0, seconds / 60)) min recorded"
+        return "\(count) \(count == 1 ? "meeting" : "meetings"), \(recorded)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("All Your Meetings")
+                    .font(SekitiriType.pageTitle)
+                    .accessibilityAddTraits(.isHeader)
+                if !allItems.isEmpty {
+                    Text(summaryLine)
+                        .font(SekitiriType.sans(17))
+                        .foregroundStyle(SekitiriColor.muted)
+                }
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 14) { searchField; filterPills }
+                VStack(alignment: .leading, spacing: 12) { searchField; filterPills }
+            }
+
+            if items.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(isFiltering ? "No matching meetings" : "Your meetings will live here")
+                        .font(SekitiriType.subTitle)
+                    Text(isFiltering
+                         ? "Try a different title, person or phrase from the notes, or clear the filters."
+                         : "Record a meeting to keep its transcript, notes, action items and your own notes together here.")
+                        .font(SekitiriType.body)
+                        .foregroundStyle(SekitiriColor.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 12)
+            } else {
+                ForEach(MeetingGroup.grouped(items)) { group in
+                    VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(group.title)
+                                .font(SekitiriType.labelStrong)
+                                .foregroundStyle(SekitiriColor.muted)
+                                .accessibilityAddTraits(.isHeader)
+                            Rectangle().fill(SekitiriColor.rule).frame(height: 1)
+                        }
+                        SKColumnGrid(items: group.items) { item in
+                            MeetingColumn(item: item, showsTime: true, open: { open(item) },
+                                          retry: item.status == .needsAttention ? { model.retryTranscription(for: item.workingDirectory) } : nil)
+                                .contextMenu {
+                                    Button("Open") { open(item) }
+                                    Button("Rename…") { rename(item) }
+                                    Button("Show in Finder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+                                    }
+                                    if item.sourceSession != nil {
+                                        Divider()
+                                        Button("Move to Trash", role: .destructive) { delete(item) }
+                                    }
+                                }
+                        }
+                    }
+                }
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? Color.accentColor : Color(.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .background {
+            Button("") { searchFocused = true }
+                .keyboardShortcut("f", modifiers: .command)
+                .hidden()
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(SekitiriColor.muted)
+                .accessibilityHidden(true)
+            TextField("Search titles, people and notes", text: $query)
+                .textFieldStyle(.plain)
+                .font(SekitiriType.body)
+                .focused($searchFocused)
+                .accessibilityLabel("Search meetings")
+            if query.isEmpty {
+                SKKbd(keys: "⌘F")
+            } else {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(SekitiriColor.muted)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(minWidth: 280, maxWidth: .infinity)
+        .frame(height: 44)
+        .background(SekitiriColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .stroke(searchFocused ? SekitiriColor.terracotta : SekitiriColor.line, lineWidth: searchFocused ? 1.5 : 1))
+    }
+
+    private var filterPills: some View {
+        SKSegmented(selection: $filter, options: ArchiveFilter.allCases) { $0.rawValue }
+            .fixedSize()
+    }
+}
+
+/// People who attended, from calendar attendees. Click one to filter.
+private struct PeopleRail: View {
+    let items: [MeetingItem]
+    @Binding var selected: String?
+
+    /// Calendar attendees without a display name arrive as email addresses;
+    /// the part before "@" reads better on a chip.
+    static func display(_ name: String) -> String {
+        guard name.contains("@"), let local = name.split(separator: "@").first else { return name }
+        return String(local)
+    }
+
+    private var people: [(name: String, count: Int)] {
+        var counts: [String: Int] = [:]
+        for item in items { for name in Set(item.participants) { counts[name, default: 0] += 1 } }
+        return counts.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .prefix(16).map { ($0.key, $0.value) }
+    }
+
+    var body: some View {
+        SKSectionHeader("People")
+        if people.isEmpty {
+            Text("People appear here when your meetings have attendees from your calendar.")
+                .font(SekitiriType.meta)
+                .foregroundStyle(SekitiriColor.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            Text("Filter by who was in the room")
+                .font(SekitiriType.meta)
+                .foregroundStyle(SekitiriColor.muted)
+            SKFlowLayout(spacing: 8) {
+                ForEach(people, id: \.name) { person in
+                    let isOn = selected == person.name
+                    Button { selected = isOn ? nil : person.name } label: {
+                        Text("\(Self.display(person.name)) (\(person.count))")
+                            .font(SekitiriType.label)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 230, alignment: .leading)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .foregroundStyle(isOn ? SekitiriColor.onAccent : SekitiriColor.ink)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(isOn ? SekitiriColor.terracotta : SekitiriColor.blush, in: Capsule())
+                    }
+                    .buttonStyle(SekitiriHoverButtonStyle())
+                    .help(person.name)
+                    .accessibilityLabel("\(person.name), \(person.count) meetings")
+                    .accessibilityAddTraits(isOn ? .isSelected : [])
+                }
+            }
+            if selected != nil {
+                Button("Show Everyone") { selected = nil }
+                    .buttonStyle(.skLink)
+                    .font(SekitiriType.labelStrong)
+            }
+        }
+    }
+}
+
+/// One meeting in a ruled column: status, title, one-line summary and an
+/// action. Used by the dashboard and the archive.
+struct MeetingColumn: View {
+    let item: MeetingItem
+    var showsTime = false
+    var showsButton = false
+    let open: () -> Void
+    var retry: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(statusLine)
+                    .font(SekitiriType.sans(12, .semibold))
+                    .foregroundStyle(statusColor)
+                Spacer(minLength: 8)
+                if showsTime, let slot = timeSlot {
+                    Text(slot)
+                        .font(SekitiriType.caption.monospacedDigit())
+                        .foregroundStyle(SekitiriColor.muted)
+                }
+            }
+            Button(action: open) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(item.title)
+                        .font(SekitiriType.serif(26, .medium))
+                        .foregroundStyle(SekitiriColor.ink)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(SummaryParser.inline(item.excerpt))
+                        .font(SekitiriType.meta)
+                        .foregroundStyle(SekitiriColor.muted)
+                        .lineSpacing(3)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(SekitiriHoverButtonStyle())
+            .accessibilityLabel("\(item.title), \(statusLine)")
+            .accessibilityHint("Opens the meeting")
+            if let retry {
+                Button("Retry Transcript", action: retry)
+                    .buttonStyle(.sk(.secondary, .small))
+                    .padding(.top, 4)
+            } else if showsButton {
+                Button(item.status == .transcribing ? "View Progress" : "Open Notes", action: open)
+                    .buttonStyle(.sk(.primary, .small))
+                    .padding(.top, 4)
+                    .accessibilityLabel("\(item.status == .transcribing ? "View progress for" : "Open notes for") \(item.title)")
+            }
+        }
+    }
+
+    private var timeSlot: String? {
+        guard let date = item.date else { return nil }
+        let day = Calendar.current.isDateInToday(date)
+            ? date.formatted(date: .omitted, time: .shortened)
+            : date.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated))
+        guard let seconds = item.durationSeconds, seconds > 0 else { return day }
+        return "\(day) | \(SKDate.duration(TimeInterval(seconds)))"
+    }
+
+    private var statusLine: String {
+        switch item.status {
+        case .actionsPending: return "Action items open"
+        case .notesReady: return "Summary ready"
+        default: return item.status.title
+        }
+    }
+
+    private var statusColor: Color {
+        switch item.status {
+        case .transcribing: return SekitiriColor.terracotta
+        case .notesReady: return SekitiriColor.sage
+        case .actionsPending: return SekitiriColor.bronze
+        case .needsAttention: return SekitiriColor.danger
+        case .transcriptReady: return SekitiriColor.muted
+        }
     }
 }
 
@@ -355,11 +655,16 @@ struct MeetingCard: View {
 
 struct MeetingDetailView: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.skShowsRail) private var showsRail
     let item: MeetingItem
+    let onBack: () -> Void
     @StateObject private var playback = PlaybackManager()
     @State private var tab: DetailTab = .summary
     @State private var summaryRaw = ""
     @State private var transcriptRaw = ""
+    @State private var transcript = TranscriptDocument.empty
+    @State private var speakerNames = SpeakerNames()
+    @State private var trackURLs: [URL] = []
     @State private var parsedSections: [SummarySection] = []
     @State private var summaryDocument: CanonicalSummaryDocument?
     @State private var selectedEvidence: SummaryEvidenceSource?
@@ -375,6 +680,16 @@ struct MeetingDetailView: View {
     @State private var transcriptFailureReason: String?
     @State private var actionSaveError: String?
     @State private var showShareSheet = false
+    @State private var transcriptQuery = ""
+    @State private var pendingSeek: TimeInterval?
+    @State private var renamingSpeaker: String?
+    @State private var renameText = ""
+    @State private var choseInitialTab = false
+    @State private var editingTitle = false
+    @State private var moments: [MarkedMoment] = []
+    @State private var titleDraft = ""
+    @State private var renameFailed = false
+    @FocusState private var titleFocused: Bool
     @AppStorage("summaryTone") private var summaryTone = "Concise"
     @AppStorage("summaryPrompt.concise") private var concisePrompt = ""
     @AppStorage("summaryPrompt.detailed") private var detailedPrompt = ""
@@ -386,24 +701,53 @@ struct MeetingDetailView: View {
         var id: String { rawValue }
     }
 
+    private var activeSegmentID: Int? {
+        guard playback.hasLoadedTrack, playback.isPlaying || playback.isPaused else { return nil }
+        return transcript.segmentID(at: playback.currentTime)
+    }
+
     var body: some View {
-        GeometryReader { proxy in
-            let compact = proxy.size.width < 860
-            if compact {
-                VStack(spacing: 0) {
-                    summaryControls(compact: true)
-                    detailDocument(compact: true)
+        SKRailLayout(padded: false) {
+            ScrollViewReader { proxy in
+                SKScroll {
+                    VStack(alignment: .leading, spacing: 28) {
+                        header
+                        SKTabRow(selection: $tab, tabs: DetailTab.allCases) { $0.rawValue }
+                        if tab == .summary { summaryTab } else { transcriptTab }
+                        if tab == .summary || !showsRail { additionalNotesEditor }
+                    }
+                    .padding(SKLayout.pagePadding)
+                    .frame(maxWidth: 1000, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-            } else {
-                HStack(spacing: 0) {
-                    detailDocument(compact: false)
-                    summaryControls(compact: false)
+                .onChange(of: activeSegmentID) { _, id in
+                    // Follow playback only while audio is playing and nothing is filtered.
+                    guard tab == .transcript, playback.isPlaying, transcriptQuery.isEmpty, let id else { return }
+                    withAnimation(SekitiriMotion.easeOut) { proxy.scrollTo(id, anchor: .center) }
                 }
             }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !trackURLs.isEmpty { playerBar }
+            }
+        } rail: {
+            notesRail
         }
-        .onAppear(perform: load)
+        .background {
+            Button("", action: onBack)
+                .keyboardShortcut("[", modifiers: .command)
+                .hidden()
+        }
+        .onAppear {
+            load()
+            startPendingSummaryIfNeeded()
+        }
         .onChange(of: model.isTranscribing) { _, processing in
             if !processing, notesSaveError == nil { load() }
+        }
+        .onChange(of: playback.duration) { _, duration in
+            guard duration > 0, let target = pendingSeek else { return }
+            pendingSeek = nil
+            playback.seek(to: target)
         }
         .onDisappear {
             playback.stop()
@@ -413,173 +757,181 @@ struct MeetingDetailView: View {
             ShareMeetingSheet(item: item, summaryRaw: summaryRaw, transcriptRaw: transcriptRaw)
         }
         .sheet(item: $selectedEvidence) { source in
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text("Transcript source").font(SekitiriType.display(23))
-                    Spacer()
-                    Button("Done") { selectedEvidence = nil }
-                }
-                Text([source.timestampText, source.speaker].compactMap { $0 }.joined(separator: " · "))
-                    .font(SekitiriType.body(12)).foregroundStyle(SekitiriColor.terracotta)
-                Text(source.quote).font(.system(size: 16, design: .serif)).textSelection(.enabled)
-                Text("This quotation is preserved from the transcript. Review the recording for the surrounding context.")
-                    .font(SekitiriType.body(11)).foregroundStyle(SekitiriColor.muted)
-            }.padding(28).frame(minWidth: 440, idealWidth: 560)
+            EvidenceSheet(
+                source: source,
+                speakerName: source.speaker.map { speakerNames.display($0) },
+                canPlay: !trackURLs.isEmpty && source.timestampSeconds != nil,
+                play: {
+                    if let seconds = source.timestampSeconds { play(from: TimeInterval(seconds)) }
+                    selectedEvidence = nil
+                },
+                done: { selectedEvidence = nil }
+            )
+        }
+        .alert(
+            "Rename speaker",
+            isPresented: Binding(get: { renamingSpeaker != nil }, set: { if !$0 { renamingSpeaker = nil } })
+        ) {
+            TextField("Name", text: $renameText)
+            Button("Rename") { commitRename() }
+            Button("Cancel", role: .cancel) { renamingSpeaker = nil }
+        } message: {
+            Text("Shown instead of “\(renamingSpeaker.map(SpeakerNames.defaultName) ?? "")” in this meeting. Leave empty to use the original label. The transcript file isn’t changed.")
         }
     }
 
-    private func detailDocument(compact: Bool) -> some View {
-        ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    Group {
-                        if compact {
-                            VStack(alignment: .leading, spacing: 14) {
-                                meetingHeading
-                                shareButton
-                            }
-                        } else {
-                            HStack(alignment: .top) {
-                                meetingHeading
-                                Spacer()
-                                shareButton
-                            }
-                        }
-                    }
-                    .padding(.top, compact ? 24 : 42)
+    // MARK: Header
 
-                    HStack(spacing: 22) {
-                        ForEach(DetailTab.allCases) { value in
-                            Button(value.rawValue) { tab = value }
-                                .font(SekitiriType.body(14, weight: tab == value ? .semibold : .regular))
-                                .foregroundStyle(tab == value ? SekitiriColor.terracotta : SekitiriColor.muted)
-                                .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.top, 38)
-                    Divider().overlay(SekitiriColor.line).padding(.top, 10)
-
-                    if tab == .summary {
-                        if compact {
-                            VStack(alignment: .leading, spacing: 28) {
-                                summaryBody
-                                actionItemsPanel
-                            }
-                        } else {
-                            HStack(alignment: .top, spacing: 32) {
-                                summaryBody.frame(maxWidth: .infinity, alignment: .leading)
-                                Divider().overlay(SekitiriColor.line).frame(height: 430)
-                                actionItemsPanel.frame(width: 310)
-                            }
-                        }
-                    } else {
-                        transcriptContent
-                    }
-                    additionalNotesEditor
-                    if let errorMessage { Text(errorMessage).font(SekitiriType.body(11)).foregroundStyle(.red).padding(.top, 16) }
-                }
-                .padding(.horizontal, compact ? 24 : 42).padding(.bottom, 40)
-            }
-            .frame(maxWidth: .infinity).background(SekitiriColor.canvas)
+    private var headingStatus: MeetingStatus {
+        if transcriptIsProcessing { return .transcribing }
+        if transcriptFailed { return .needsAttention }
+        if summaryDocument != nil || !summaryRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return actionItems.contains(where: { !$0.checked }) ? .actionsPending : .notesReady
+        }
+        return transcriptRaw.isEmpty && transcript.isEmpty ? item.status : .transcriptReady
     }
 
-    private var meetingHeading: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text("Recording complete")
-                .font(SekitiriType.display(24))
-                .foregroundStyle(SekitiriColor.terracotta)
-            Text(item.title)
-                .font(SekitiriType.display(43))
-                .lineLimit(2)
-            Text(item.dateString + (item.duration.isEmpty ? "" : " · \(item.duration) elapsed"))
-                .font(SekitiriType.body(13))
-                .foregroundStyle(SekitiriColor.muted)
-            playbackControls
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Button(action: onBack) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
+                        Text("All meetings").font(SekitiriType.labelStrong)
+                        SKKbd(keys: "⌘[")
+                    }
+                    .foregroundStyle(SekitiriColor.muted)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Back to all meetings (⌘[)")
+                Spacer()
+                if hasShareableOutput {
+                    Button { showShareSheet = true } label: {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.skOutline)
+                }
+            }
+            titleRow
+            if renameFailed {
+                Text("Couldn’t save the new name. This meeting has no metadata file to update.")
+                    .font(SekitiriType.caption)
+                    .foregroundStyle(SekitiriColor.dangerText)
+            }
+            HStack(spacing: 12) {
+                SekitiriStatusBadge(title: headingStatus.title, kind: headingStatus.kind)
+                Text(dateLine)
+                    .font(SekitiriType.sans(17))
+                    .foregroundStyle(SekitiriColor.muted)
+            }
+            if !item.participants.isEmpty {
+                Text("With \(item.participants.joined(separator: ", "))")
+                    .font(SekitiriType.meta)
+                    .foregroundStyle(SekitiriColor.muted)
+                    .lineLimit(2)
+            }
+            if trackURLs.isEmpty {
+                Label("No saved audio for this meeting.", systemImage: "speaker.slash")
+                    .font(SekitiriType.caption)
+                    .foregroundStyle(SekitiriColor.muted)
+            }
         }
     }
 
-    private var playbackControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Button {
-                    playback.toggle(trackURLs: item.recordingTrackURLs)
-                } label: {
-                    Image(systemName: playback.isPreparing ? "hourglass" : playback.isPlaying ? "pause.fill" : "play.fill")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(SekitiriColor.terracotta)
-                .disabled(playback.isPreparing)
-                .accessibilityLabel(playback.isPlaying ? "Pause recording" : "Play recording")
-
-                Button {
-                    playback.stop()
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(SekitiriColor.muted)
-                .disabled(!playback.isPlaying && !playback.isPaused)
-                .accessibilityLabel("Stop playback")
-
-                Slider(
-                    value: Binding(
-                        get: { playback.currentTime },
-                        set: { playback.seek(to: $0) }
-                    ),
-                    in: 0...max(playback.duration, 1)
-                )
-                .tint(SekitiriColor.terracotta)
-                .disabled(!playback.hasLoadedTrack)
-
-                Text("\(playback.timeLabel(playback.currentTime)) / \(playback.timeLabel(playback.duration))")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(SekitiriColor.muted)
-                    .fixedSize()
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(.white.opacity(0.55), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(SekitiriColor.line))
-
-            if let message = playback.message {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
-                    .font(SekitiriType.body(10))
-                    .foregroundStyle(.red)
-            } else if let notice = playback.notice {
-                Label(notice, systemImage: "info.circle")
-                    .font(SekitiriType.body(10))
-                    .foregroundStyle(SekitiriColor.muted)
-            } else if playback.isPreparing {
-                Text("Opening saved recording…")
-                    .font(SekitiriType.body(10))
-                    .foregroundStyle(SekitiriColor.muted)
-            } else if item.recordingTrackURLs.isEmpty {
-                Text("No saved audio track is available for this meeting.")
-                    .font(SekitiriType.body(10))
-                    .foregroundStyle(SekitiriColor.muted)
+    private var titleRow: some View {
+        HStack(alignment: .center, spacing: 14) {
+            if editingTitle {
+                TextField("Meeting name", text: $titleDraft)
+                    .textFieldStyle(.plain)
+                    .font(SekitiriType.pageTitle)
+                    .focused($titleFocused)
+                    .onSubmit { commitTitle() }
+                    .onExitCommand { editingTitle = false }
+                    .accessibilityLabel("Meeting name")
             } else {
-                Text("Play saved audio")
-                    .font(SekitiriType.body(10))
-                    .foregroundStyle(SekitiriColor.muted)
+                Text(item.title)
+                    .font(SekitiriType.pageTitle)
+                    .foregroundStyle(SekitiriColor.ink)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
+                    .onTapGesture(count: 2) { beginTitleEdit() }
             }
+            Button { if editingTitle { commitTitle() } else { beginTitleEdit() } } label: {
+                Image(systemName: editingTitle ? "checkmark" : "pencil")
+                    .font(.system(size: 15))
+                    .foregroundStyle(editingTitle ? SekitiriColor.terracotta : SekitiriColor.muted)
+                    .frame(width: 36, height: 36)
+                    .background(SekitiriColor.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(SekitiriColor.line))
+            }
+            .buttonStyle(.plain)
+            .help(editingTitle ? "Save name (Return)" : "Rename this meeting")
+            .accessibilityLabel(editingTitle ? "Save meeting name" : "Rename meeting")
+            Spacer(minLength: 0)
         }
-        .padding(.top, 5)
     }
 
-    private var shareButton: some View {
-        Group {
-            if hasShareableOutput {
-                Button { showShareSheet = true } label: {
-                    Label("Share", systemImage: "square.and.arrow.up")
-                }
-                .font(SekitiriType.body(12, weight: .medium))
-                .buttonStyle(.plain)
-                .foregroundStyle(SekitiriColor.ink)
-                .padding(.horizontal, 13).padding(.vertical, 9)
-                .background(.white.opacity(0.5), in: Capsule())
-                .overlay(Capsule().stroke(SekitiriColor.line))
+    private func beginTitleEdit() {
+        titleDraft = item.title == "Untitled meeting" ? "" : item.title
+        renameFailed = false
+        editingTitle = true
+        titleFocused = true
+    }
+
+    private func commitTitle() {
+        let name = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        editingTitle = false
+        guard name != item.title else { return }
+        renameFailed = !model.renameMeeting(item, to: name)
+    }
+
+    /// "Wednesday, 4 November · 9:36 AM · 41 min"
+    private var dateLine: String {
+        guard let date = item.date else { return item.duration }
+        return [SKDate.dayLine(date), date.formatted(date: .omitted, time: .shortened), item.duration.isEmpty ? nil : item.duration]
+            .compactMap { $0 }.joined(separator: " · ")
+    }
+
+    // MARK: Notes rail
+
+    @ViewBuilder
+    private var notesRail: some View {
+        SKSectionHeader("Notes")
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Model").font(SekitiriType.labelStrong)
+            SummaryEnginePicker()
+            Text("On this Mac. Nothing is sent anywhere.")
+                .font(SekitiriType.caption)
+                .foregroundStyle(SekitiriColor.muted)
+        }
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Summary Tone").font(SekitiriType.labelStrong)
+            Picker("Summary tone", selection: $summaryTone) {
+                ForEach(SummaryTonePrompts.tones, id: \.self) { Text($0).tag($0) }
             }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .fixedSize()
+            .disabled(isSummarizing)
+        }
+        HStack(spacing: 8) { summaryButtons }
+        summaryStatus
+        Rectangle().fill(SekitiriColor.rule).frame(height: 1).padding(.vertical, 6)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Export").font(SekitiriType.labelStrong)
+            if hasShareableOutput {
+                Button("Share or Export…") { showShareSheet = true }
+                    .buttonStyle(.sk(.outline, .small))
+            }
+            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
+                .buttonStyle(.sk(.outline, .small))
+        }
+        if tab == .transcript {
+            Rectangle().fill(SekitiriColor.rule).frame(height: 1).padding(.vertical, 6)
+            additionalNotesEditor
         }
     }
 
@@ -588,251 +940,389 @@ struct MeetingDetailView: View {
             || !transcriptRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    @ViewBuilder
-    private var summaryBody: some View {
-        VStack(alignment: .leading, spacing: 20) {
+    // MARK: Player
+
+    private var playerBar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                Button {
+                    playback.toggle(trackURLs: trackURLs)
+                } label: {
+                    Image(systemName: playback.isPreparing ? "hourglass" : playback.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.title3)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.borderless)
+                .disabled(playback.isPreparing)
+                .accessibilityLabel(playback.isPlaying ? "Pause recording" : "Play recording")
+
+                Button { playback.stop() } label: {
+                    Image(systemName: "stop.fill").frame(width: 24, height: 24)
+                }
+                .buttonStyle(.borderless)
+                .disabled(!playback.isPlaying && !playback.isPaused)
+                .accessibilityLabel("Stop playback")
+
+                Text(playback.timeLabel(playback.currentTime))
+                    .font(SekitiriType.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(SekitiriColor.muted)
+
+                Slider(
+                    value: Binding(get: { playback.currentTime }, set: { playback.seek(to: $0) }),
+                    in: 0...max(playback.duration, 1)
+                )
+                .disabled(!playback.hasLoadedTrack)
+                .accessibilityLabel("Playback position")
+
+                Text(playback.hasLoadedTrack ? playback.timeLabel(playback.duration) : "--:--")
+                    .font(SekitiriType.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(SekitiriColor.muted)
+            }
+            if let message = playback.message {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(SekitiriType.caption).foregroundStyle(SekitiriColor.warning)
+            } else if let notice = playback.notice {
+                Label(notice, systemImage: "info.circle")
+                    .font(SekitiriType.caption).foregroundStyle(SekitiriColor.muted)
+            }
+        }
+        .padding(.horizontal, 40)
+        .padding(.vertical, 12)
+        .background(SekitiriColor.sidebar)
+        .overlay(alignment: .top) { Rectangle().fill(SekitiriColor.border).frame(height: 1) }
+    }
+
+    /// Seeks to `seconds` and plays, loading the recording first if needed.
+    private func play(from seconds: TimeInterval) {
+        guard !trackURLs.isEmpty else { return }
+        if playback.hasLoadedTrack && (playback.isPlaying || playback.isPaused) {
+            playback.seek(to: seconds)
+            if playback.isPaused { playback.toggle(trackURLs: trackURLs) }
+        } else {
+            pendingSeek = seconds
+            playback.start(trackURLs: trackURLs)
+        }
+    }
+
+    // MARK: Summary
+
+    private var summaryTab: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            if !showsRail { summaryControls }
             if let document = summaryDocument, document.modelID != "legacy-markdown" {
                 let isDraft = document.modelID.hasSuffix("+source-draft")
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(isDraft ? "Source-based draft" : "Source-based notes")
-                        .font(SekitiriType.body(11, weight: .medium))
-                        .foregroundStyle(SekitiriColor.terracotta)
-                    Text(isDraft
-                         ? "These source-based notes need review. They preserve explicit transcript statements; check linked passages and the recording for context."
-                         : "Extractive notes keep the transcript’s wording. Tasks include explicit commitments; implicit commitments may need review. Check source links for context.")
-                        .font(SekitiriType.body(11))
-                        .foregroundStyle(SekitiriColor.muted)
-                        .fixedSize(horizontal: false, vertical: true)
+                Label(isDraft
+                      ? "Source-based draft — check the linked passages and the recording for context."
+                      : "Notes keep the transcript’s wording. Implicit commitments may need review; source links show where each point came from.",
+                      systemImage: "text.quote")
+                    .font(SekitiriType.meta)
+                    .foregroundStyle(SekitiriColor.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            summaryBody
+            actionItemsPanel
+            if !moments.isEmpty { momentsPanel }
+        }
+    }
+
+    private var summaryControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) { summaryPickers; Spacer(minLength: 8); summaryButtons }
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 12) { summaryPickers }
+                    HStack(spacing: 12) { summaryButtons }
                 }
             }
+            summaryStatus
+        }
+        .sekitiriCard()
+    }
+
+    @ViewBuilder
+    private var summaryPickers: some View {
+        SummaryEnginePicker()
+        Picker("Tone", selection: $summaryTone) {
+            ForEach(SummaryTonePrompts.tones, id: \.self) { Text($0).tag($0) }
+        }
+        .pickerStyle(.menu)
+        .fixedSize()
+        .disabled(isSummarizing)
+    }
+
+    @ViewBuilder
+    private var summaryButtons: some View {
+        if isSummarizing {
+            Button("Cancel") { summaryTask?.cancel() }
+                .buttonStyle(.skOutline)
+        }
+        Button(action: resummarize) {
+            Label(summaryDocument == nil && summaryRaw.isEmpty ? "Create Notes" : "Summarise Again", systemImage: "arrow.clockwise")
+        }
+        .buttonStyle(.skPrimary)
+        .disabled(isSummarizing || model.summaryModelActionMessage != nil)
+    }
+
+    @ViewBuilder
+    private var summaryStatus: some View {
+        if isSummarizing {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(summaryProgress?.label ?? "Preparing summary…")
+                    .font(SekitiriType.meta)
+                    .foregroundStyle(SekitiriColor.muted)
+            }
+        } else if let errorMessage {
+            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                .font(SekitiriType.meta)
+                .foregroundStyle(SekitiriColor.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if model.selectedModel.requiresDownload, !model.isTranscribing, !model.recording {
+            SummaryModelDownloadRow()
+        } else if let message = model.summaryModelActionMessage {
+            Label(message, systemImage: "info.circle")
+                .font(SekitiriType.meta)
+                .foregroundStyle(SekitiriColor.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var summaryBody: some View {
+        VStack(alignment: .leading, spacing: 22) {
             if parsedSections.isEmpty {
                 Text(summaryDocument != nil
                      ? (actionItems.isEmpty
-                        ? "No decisions, key points or open questions were identified in this transcript. You can review the transcript or generate the summary again."
+                        ? "No decisions, key points or open questions were found in this transcript. Review the transcript or summarise again."
                         : "The follow-up commitments from this meeting are listed under Action Items.")
-                     : (summaryRaw.isEmpty ? "Your summary will appear here once it is ready." : summaryRaw))
-                    .font(.system(size: 16, design: .serif)).foregroundStyle(SekitiriColor.ink)
+                     : (summaryRaw.isEmpty ? "Notes appear here after you summarise this meeting." : summaryRaw))
+                    .font(SekitiriType.reading)
+                    .foregroundStyle(summaryRaw.isEmpty && summaryDocument == nil ? SekitiriColor.muted : SekitiriColor.ink)
                     .lineSpacing(3)
+                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                ForEach(parsedSections.filter { !$0.title.localizedCaseInsensitiveContains("action item") }) {
-                    SummarySectionView(section: $0, onEvidence: { selectedEvidence = $0 })
+                ForEach(parsedSections.filter { !$0.title.localizedCaseInsensitiveContains("action item") && !$0.isEmptyPlaceholder }) {
+                    SummarySectionView(
+                        section: $0,
+                        onEvidence: { selectedEvidence = $0 },
+                        onPlay: trackURLs.isEmpty ? nil : { source in
+                            if let seconds = source.timestampSeconds { play(from: TimeInterval(seconds)) }
+                        }
+                    )
                 }
             }
         }
-        .padding(.top, 26)
     }
 
     private var actionItemsPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Action Items").font(SekitiriType.display(25))
+        VStack(alignment: .leading, spacing: 12) {
+            SKSectionHeader("Action Items", font: SekitiriType.subTitle)
             if actionItems.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Image(systemName: "checkmark.circle").font(.system(size: 22)).foregroundStyle(SekitiriColor.terracotta)
-                    Text("No action items detected").font(SekitiriType.body(13, weight: .medium))
-                    Text("When the meeting contains clear follow-up commitments, they’ll appear here.")
-                        .font(SekitiriType.body(11)).foregroundStyle(SekitiriColor.muted)
+                VStack(alignment: .leading, spacing: 6) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.title3)
+                        .foregroundStyle(SekitiriColor.terracotta)
+                        .accessibilityHidden(true)
+                    Text("No action items found").font(SekitiriType.bodyStrong)
+                    Text("Clear follow-up commitments from the meeting appear here.")
+                        .font(SekitiriType.meta)
+                        .foregroundStyle(SekitiriColor.muted)
                 }
-                .padding(.top, 4)
             } else {
-                ForEach(actionItems) { item in
-                    SekitiriActionItemRow(text: String(SummaryParser.inline(item.text).characters), isChecked: item.checked) {
-                        toggleAction(item)
-                    }
-                    .accessibilityLabel("\(item.checked ? "Mark incomplete" : "Mark complete"): \(item.text)")
-                    .disabled(isSummarizing)
-                    if let action = summaryDocument?.actionItems.first(where: { $0.id == item.id }) {
-                        HStack(spacing: 10) {
-                            ForEach(action.evidenceSourceIDs, id: \.self) { sourceID in
-                                if let source = summaryDocument?.sources.first(where: { $0.id == sourceID }) {
-                                    Button { selectedEvidence = source } label: {
-                                        Label(source.timestampText ?? "Transcript", systemImage: "text.quote")
+                ForEach(actionItems) { action in
+                    VStack(alignment: .leading, spacing: 4) {
+                        SekitiriActionItemRow(text: String(SummaryParser.inline(action.text).characters), isChecked: action.checked) {
+                            toggleAction(action)
+                        }
+                        .accessibilityLabel("\(action.checked ? "Completed" : "Not completed"): \(action.text)")
+                        .accessibilityHint(action.checked ? "Marks the item incomplete" : "Marks the item complete")
+                        .disabled(isSummarizing)
+                        if let stored = summaryDocument?.actionItems.first(where: { $0.id == action.id }) {
+                            HStack(spacing: 10) {
+                                ForEach(stored.evidenceSourceIDs, id: \.self) { sourceID in
+                                    if let source = summaryDocument?.sources.first(where: { $0.id == sourceID }) {
+                                        EvidenceChip(source: source, onOpen: { selectedEvidence = source },
+                                                     onPlay: trackURLs.isEmpty ? nil : { _ in
+                                                         if let seconds = source.timestampSeconds { play(from: TimeInterval(seconds)) }
+                                                     })
                                     }
-                                    .buttonStyle(.plain).font(SekitiriType.body(10)).foregroundStyle(SekitiriColor.terracotta)
                                 }
                             }
+                            .padding(.leading, 34)
                         }
                     }
                 }
             }
             if let actionSaveError {
                 Label(actionSaveError, systemImage: "exclamationmark.triangle.fill")
-                    .font(SekitiriType.body(10)).foregroundStyle(.red)
+                    .font(SekitiriType.caption).foregroundStyle(SekitiriColor.warning)
             }
         }
-        .padding(.top, 26)
     }
 
+    private var momentsPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SKSectionHeader("Marked Moments", font: SekitiriType.subTitle)
+            ForEach(moments) { moment in
+                HStack(alignment: .firstTextBaseline, spacing: 14) {
+                    let clock = TranscriptDocument.clock(moment.seconds)
+                    if trackURLs.isEmpty {
+                        Text(clock)
+                            .font(SekitiriType.label.monospacedDigit())
+                            .foregroundStyle(SekitiriColor.terracotta)
+                    } else {
+                        Button(clock) { play(from: moment.seconds) }
+                            .buttonStyle(.plain)
+                            .font(SekitiriType.label.monospacedDigit())
+                            .foregroundStyle(SekitiriColor.terracotta)
+                            .help("Play from \(clock)")
+                            .accessibilityLabel("Play from \(clock)")
+                    }
+                    Text(moment.label)
+                        .font(SekitiriType.reading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    // MARK: Transcript
+
+    @ViewBuilder
+    private var transcriptTab: some View {
+        if transcriptIsProcessing && transcript.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text("Transcription is in progress").font(SekitiriType.title3)
+                Text("Your recording is safe. The timestamped transcript appears here as soon as on-device transcription finishes.")
+                    .font(SekitiriType.meta).foregroundStyle(SekitiriColor.muted)
+            }
+        } else if transcriptFailed && transcript.isEmpty {
+            SekitiriBanner(
+                systemImage: "exclamationmark.triangle.fill",
+                title: "Transcription needs attention",
+                message: "The recording was preserved. Retry transcription or show the saved audio files."
+            ) {
+                Button("Retry Transcription") { model.retryTranscription(for: item.workingDirectory) }
+                    .buttonStyle(.skPrimary)
+                    .disabled(model.isTranscribing)
+                Button("Show Recording") { model.revealRecording(at: item.workingDirectory) }
+            }
+        } else if transcript.isEmpty {
+            Text("No transcript has been created for this recording yet.")
+                .font(SekitiriType.meta).foregroundStyle(SekitiriColor.muted)
+        } else {
+            VStack(alignment: .leading, spacing: 14) {
+                if transcriptFailed {
+                    SekitiriBanner(
+                        systemImage: "exclamationmark.triangle.fill",
+                        title: "Transcript incomplete",
+                        message: transcriptFailureReason ?? "Some audio couldn’t be transcribed. Available speech is shown below."
+                    ) {
+                        Button("Retry Transcription") { model.retryTranscription(for: item.workingDirectory) }
+                            .disabled(model.isTranscribing)
+                        Button("Show Recording") { model.revealRecording(at: item.workingDirectory) }
+                    }
+                }
+                HStack(spacing: 10) {
+                    TranscriptSearchField(text: $transcriptQuery)
+                        .frame(maxWidth: 320)
+                    Spacer(minLength: 0)
+                    CopyTranscriptButton(text: transcript.plainText(names: speakerNames))
+                }
+                if transcript.segments.contains(where: \.hasLowConfidence) {
+                    Label("Words with a dotted underline were transcribed with low confidence.", systemImage: "info.circle")
+                        .font(SekitiriType.caption)
+                        .foregroundStyle(SekitiriColor.muted)
+                }
+                TranscriptListView(
+                    segments: transcript.segments,
+                    names: speakerNames,
+                    query: transcriptQuery,
+                    activeID: activeSegmentID,
+                    onSeek: trackURLs.isEmpty ? nil : { play(from: $0) },
+                    onRename: transcript.directory == nil ? nil : { raw in
+                        renameText = speakerNames.names[raw] ?? ""
+                        renamingSpeaker = raw
+                    }
+                )
+            }
+        }
+    }
+
+    private func commitRename() {
+        guard let raw = renamingSpeaker, let directory = transcript.directory else { return }
+        var updated = speakerNames
+        let name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.names[raw] = name.isEmpty ? nil : name
+        do {
+            try updated.save(to: directory)
+            speakerNames = updated
+            errorMessage = nil
+        } catch {
+            errorMessage = "Couldn’t save the speaker name: \(error.localizedDescription)"
+        }
+        renamingSpeaker = nil
+    }
+
+    // MARK: Notes
+
     private var additionalNotesEditor: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Your Additional Notes").font(SekitiriType.display(23))
-                .padding(.top, 34)
-            Divider().overlay(SekitiriColor.line)
-            Text("Your own context is saved with this meeting and used the next time you summarise it.")
-                .font(SekitiriType.body(11)).foregroundStyle(SekitiriColor.muted)
+        VStack(alignment: .leading, spacing: 8) {
+            SKSectionHeader("Your Additional Notes", font: SekitiriType.subTitle)
+            Text("Saved with this meeting and used the next time you summarise it.")
+                .font(SekitiriType.meta).foregroundStyle(SekitiriColor.muted)
             TextEditor(text: Binding(get: { additionalNotes }, set: { value in
                 additionalNotes = value
                 saveAdditionalNotes()
             }))
-                .font(.system(size: 14, design: .serif))
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 130)
-                .padding(10)
-                .background(.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(SekitiriColor.line))
+            .font(SekitiriType.reading)
+            .scrollContentBackground(.hidden)
+            .frame(minHeight: 120)
+            .padding(10)
+            .background(SekitiriColor.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(SekitiriColor.border))
+            .accessibilityLabel("Your notes")
             if let notesSaveError {
                 HStack(spacing: 8) {
                     Label(notesSaveError, systemImage: "exclamationmark.triangle.fill")
-                        .font(SekitiriType.body(10)).foregroundStyle(.red)
-                    Button("Retry save", action: saveAdditionalNotes)
-                        .font(SekitiriType.body(10, weight: .medium)).buttonStyle(.plain)
-                        .foregroundStyle(SekitiriColor.terracotta)
+                        .font(SekitiriType.caption).foregroundStyle(SekitiriColor.warning)
+                    Button("Retry Save", action: saveAdditionalNotes)
                 }
             } else {
                 Text(notesSaveStatus.isEmpty ? "Saved automatically." : notesSaveStatus)
-                    .font(SekitiriType.body(10)).foregroundStyle(SekitiriColor.muted)
+                    .font(SekitiriType.caption).foregroundStyle(SekitiriColor.muted)
             }
         }
+        .padding(.top, 8)
     }
 
-    @ViewBuilder
-    private var transcriptContent: some View {
-        if transcriptIsProcessing && transcriptRaw.isEmpty {
-            VStack(alignment: .leading, spacing: 12) {
-                ProgressView().controlSize(.small)
-                Text("Transcription is processing").font(SekitiriType.display(23))
-                Text("Your recording is safe. Timestamped transcript entries will appear here as soon as on-device transcription finishes.")
-                    .font(SekitiriType.body(13)).foregroundStyle(SekitiriColor.muted)
-            }
-            .padding(.top, 28)
-        } else if transcriptFailed && transcriptRaw.isEmpty {
-            VStack(alignment: .leading, spacing: 12) {
-                Label("Transcription needs attention", systemImage: "exclamationmark.triangle.fill")
-                    .font(SekitiriType.display(22)).foregroundStyle(.red)
-                Text("The recording was preserved. Retry transcription or reveal the saved audio files.")
-                    .font(SekitiriType.body(13)).foregroundStyle(SekitiriColor.muted)
-                HStack(spacing: 10) {
-                    Button("Retry transcription") { model.retryTranscription(for: item.sourceSession ?? item.url) }
-                        .buttonStyle(.borderedProminent)
-                    Button("Show recording") { model.revealRecording(at: item.sourceSession ?? item.url) }
-                        .buttonStyle(.bordered)
-                }
-            }
-            .padding(.top, 28)
-        } else if transcriptRaw.isEmpty {
-            Text("No transcript has been created for this recording yet.")
-                .font(SekitiriType.body(14)).foregroundStyle(SekitiriColor.muted).padding(.top, 26)
-        } else {
-            LazyVStack(alignment: .leading, spacing: 9) {
-                if transcriptFailed {
-                    Label("Transcript incomplete", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.red)
-                    Text(transcriptFailureReason ?? "Some audio could not be transcribed. Available speech is shown below.")
-                        .font(SekitiriType.body(13)).foregroundStyle(SekitiriColor.muted)
-                    HStack {
-                        Button("Retry transcription") { model.retryTranscription(for: item.sourceSession ?? item.url) }
-                            .disabled(model.isTranscribing)
-                        Button("Show recording") { model.revealRecording(at: item.sourceSession ?? item.url) }
-                    }
-                }
-                ForEach(ArchivedTranscriptEntry.parse(transcriptRaw)) { entry in
-                    HStack(alignment: .top, spacing: 12) {
-                        Text(entry.timestamp)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(SekitiriColor.terracotta)
-                            .frame(width: 58, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(entry.speaker).font(SekitiriType.body(11, weight: .medium)).foregroundStyle(SekitiriColor.muted)
-                            Text(entry.text).font(.system(size: 14, design: .serif)).foregroundStyle(SekitiriColor.ink)
-                        }
-                    }
-                    .padding(.vertical, 8)
-                    Divider().overlay(SekitiriColor.line)
-                }
-            }
-            .padding(.top, 20)
-        }
-    }
-
-    private func summaryControls(compact: Bool) -> some View {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("Model").font(SekitiriType.display(20))
-                ModelPill(selected: $model.selectedModel)
-                    .disabled(model.isSummarizing || model.localSummaryModelState.isBusy)
-                Button(action: resummarize) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                        Text(isSummarizing ? "Summarising…" : "Resummarise")
-                    }
-                    .font(SekitiriType.body(13, weight: .medium))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                }
-                .buttonStyle(.plain)
-                .disabled(isSummarizing || model.summaryModelActionMessage != nil)
-                .foregroundStyle(.white)
-                .background(SekitiriColor.terracotta, in: Capsule())
-                if isSummarizing {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(summaryProgress?.label ?? "Preparing summary…")
-                            .font(SekitiriType.body(11))
-                            .foregroundStyle(SekitiriColor.muted)
-                    }
-                    Button("Cancel summary") { summaryTask?.cancel() }
-                        .buttonStyle(.plain)
-                        .font(SekitiriType.body(11, weight: .medium))
-                        .foregroundStyle(SekitiriColor.terracotta)
-                } else if let message = model.summaryModelActionMessage {
-                    Text(message)
-                        .font(SekitiriType.body(11))
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Divider().overlay(SekitiriColor.line)
-                Text("Summary Tone").font(SekitiriType.display(20))
-                HStack(spacing: 0) {
-                    ForEach(SummaryTonePrompts.tones, id: \.self) { tone in
-                        Button(tone) { summaryTone = tone }
-                            .font(SekitiriType.body(11, weight: summaryTone == tone ? .medium : .regular))
-                            .foregroundStyle(summaryTone == tone ? .white : SekitiriColor.ink)
-                            .buttonStyle(.plain)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(summaryTone == tone ? SekitiriColor.terracotta : SekitiriColor.canvas)
-                    }
-                }
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(SekitiriColor.line))
-                if !compact { Spacer() }
-            }
-            .padding(26)
-            .frame(maxWidth: compact ? .infinity : nil, alignment: .leading)
-            .frame(width: compact ? nil : 300, alignment: .leading)
-            .background(SekitiriColor.sidebar)
-    }
+    // MARK: Loading
 
     private func load() {
         let fm = FileManager.default
-        summaryRaw = (try? String(contentsOf: item.url.appendingPathComponent("summary.md"),
-                                   encoding: .utf8)) ?? ""
-        let source = item.sourceSession ?? item.url
+        trackURLs = item.loadRecordingTrackURLs()
+        moments = MarkedMoment.load(from: item.workingDirectory)
+        summaryRaw = (try? String(contentsOf: item.url.appendingPathComponent("summary.md"), encoding: .utf8)) ?? ""
+        let source = item.workingDirectory
         let modern = fm.fileExists(atPath: source.appendingPathComponent("transcription-settings.json").path)
         let transcriptDirectory = modern ? source : item.url
         let diarized = transcriptDirectory.appendingPathComponent("transcript.diarized.md")
         let plain = transcriptDirectory.appendingPathComponent("transcript.md")
         let transcriptPath = !modern && fm.fileExists(atPath: diarized.path) ? diarized : plain
-        transcriptRaw = (try? String(contentsOf: transcriptPath,
-                                      encoding: .utf8)) ?? ""
-        let logURL = (item.sourceSession ?? item.url).appendingPathComponent("transcribe.log")
-        let log = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+        transcriptRaw = (try? String(contentsOf: transcriptPath, encoding: .utf8)) ?? ""
+        transcript = TranscriptDocument.load(session: item.sourceSession, vaultFolder: item.url) ?? .empty
+        speakerNames = SpeakerNames.load(from: transcript.directory)
+        let log = (try? String(contentsOf: source.appendingPathComponent("transcribe.log"), encoding: .utf8)) ?? ""
         transcriptFailureReason = modern && !transcriptRaw.isEmpty
             ? TranscriptIntegrity.incompletenessReason(at: source) : nil
         transcriptFailed = transcriptFailureReason != nil
-            || (transcriptRaw.isEmpty && log.localizedCaseInsensitiveContains("transcription failed"))
-        transcriptIsProcessing = transcriptRaw.isEmpty && !transcriptFailed
-        let notesURL = (item.sourceSession ?? item.url).appendingPathComponent("additional-notes.md")
-        additionalNotes = (try? String(contentsOf: notesURL, encoding: .utf8)) ?? ""
+            || (transcriptRaw.isEmpty && transcript.isEmpty && log.localizedCaseInsensitiveContains("transcription failed"))
+        transcriptIsProcessing = transcriptRaw.isEmpty && transcript.isEmpty && !transcriptFailed
+        additionalNotes = (try? String(contentsOf: source.appendingPathComponent("additional-notes.md"), encoding: .utf8)) ?? ""
         notesSaveError = nil
         notesSaveStatus = "Saved automatically."
         do {
@@ -847,12 +1337,25 @@ struct MeetingDetailView: View {
             parsedSections = SummaryParser.parse(summaryRaw)
             actionSaveError = "Couldn’t open structured notes: \(error.localizedDescription)"
         }
+        if !choseInitialTab {
+            choseInitialTab = true
+            // Nothing to read on the summary tab yet; open on the transcript.
+            if summaryDocument == nil, summaryRaw.isEmpty, !transcript.isEmpty { tab = .transcript }
+        }
+    }
+
+    private func startPendingSummaryIfNeeded() {
+        guard let pending = model.pendingSummarySession,
+              pending.standardizedFileURL == item.workingDirectory.standardizedFileURL else { return }
+        model.pendingSummarySession = nil
+        tab = .summary
+        resummarize()
     }
 
     private func saveAdditionalNotes() {
         do {
             // Keep the canonical meeting immediately up to date and mirror to
-            // the source session, which is what the CLI reads on re-summary.
+            // the source session, which is what the summariser reads.
             let directories = [item.url, item.sourceSession]
                 .compactMap { $0 }
                 .reduce(into: [URL]()) { result, directory in
@@ -869,15 +1372,17 @@ struct MeetingDetailView: View {
             notesSaveStatus = "Saved automatically."
         } catch {
             notesSaveStatus = ""
-            notesSaveError = "Couldn’t save these notes. They are still in this editor—please retry before leaving."
+            notesSaveError = "Couldn’t save these notes. They are still in this editor — retry before leaving."
         }
     }
 
     private var actionItems: [PersistedActionItem] {
         if let document = summaryDocument {
-            return document.actionItems.map { PersistedActionItem(id: $0.id, lineIndex: -1, text: $0.text, checked: $0.isCompleted) }
+            return document.actionItems
+                .filter { !OpenActionItem.isPlaceholder($0.text) }
+                .map { PersistedActionItem(id: $0.id, lineIndex: -1, text: $0.text, checked: $0.isCompleted) }
         }
-        return PersistedActionItem.parse(summaryRaw)
+        return PersistedActionItem.parse(summaryRaw).filter { !OpenActionItem.isPlaceholder($0.text) }
     }
 
     private func toggleAction(_ action: PersistedActionItem) {
@@ -901,7 +1406,7 @@ struct MeetingDetailView: View {
         isSummarizing = true
         summaryProgress = .preparing
         errorMessage = nil
-        let source = item.sourceSession ?? item.url
+        let source = item.workingDirectory
         summaryTask = Task { @MainActor in
             do {
                 try await model.summarizeMeeting(
@@ -932,77 +1437,86 @@ struct MeetingDetailView: View {
     }
 }
 
-// MARK: - Meeting item model
+/// Inline download / progress / retry for the optional Qwen model, shown next
+/// to the Summarise button.
+struct SummaryModelDownloadRow: View {
+    @EnvironmentObject var model: AppModel
 
-struct MeetingItem: Identifiable {
-    let id: String
-    let url: URL
-    let title: String
-    let engine: String
-    let duration: String
-    let date: Date?
-    let participants: [String]
-    let sourceSession: URL?
-
-    /// Recordings are stored in the source session; older imported meetings
-    /// may also have their tracks directly beside the canonical note files.
-    var recordingTrackURLs: [URL] {
-        let roots = [sourceSession, url].compactMap { $0 }
-        var seen = Set<String>()
-        return roots.flatMap { root in
-            ["mic.caf", "system.caf"].map { root.appendingPathComponent($0) }
-        }.filter { candidate in
-            guard FileManager.default.fileExists(atPath: candidate.path), !seen.contains(candidate.path) else { return false }
-            seen.insert(candidate.path)
-            return true
+    var body: some View {
+        switch model.localSummaryModelState {
+        case .ready:
+            EmptyView()
+        case .notDownloaded:
+            HStack(spacing: 10) {
+                Label("Qwen 3.5 needs a one-time \(ModelItem.qwenDownloadSize) download. After that it runs offline.",
+                      systemImage: "arrow.down.circle")
+                    .font(SekitiriType.meta)
+                    .foregroundStyle(SekitiriColor.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Download") { model.downloadLocalSummaryModel() }
+            }
+        case .downloading(let progress):
+            HStack(spacing: 10) {
+                ProgressView(value: progress)
+                    .frame(maxWidth: 220)
+                    .accessibilityLabel("Downloading Qwen 3.5")
+                Text("Downloading · \(Int(progress * 100))%")
+                    .font(SekitiriType.meta).monospacedDigit()
+                    .foregroundStyle(SekitiriColor.muted)
+                Button("Cancel") { model.cancelLocalSummaryModelDownload() }
+            }
+        case .loading:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading Qwen 3.5…").font(SekitiriType.meta).foregroundStyle(SekitiriColor.muted)
+            }
+        case .failed(let message):
+            HStack(spacing: 10) {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(SekitiriType.meta)
+                    .foregroundStyle(SekitiriColor.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Retry") { model.downloadLocalSummaryModel() }
+            }
         }
-    }
-
-    var engineShort: String {
-        switch engine {
-        case "source-notes": return "Source notes · lightweight"
-        case "afm": return "Apple Foundation Model"
-        case "qwen3.5-2b": return "Qwen3.5 2B · 4-bit"
-        case "qwen3.5-0.8b": return "Qwen3.5 0.8B · 4-bit"
-        case "qwen3-4b": return "Qwen3 4B · 4-bit"
-        case "gemma3n-e2b": return "Gemma 3n E2B · 4-bit"
-        default: return engine.isEmpty ? "Local" : engine
-        }
-    }
-
-    var dateString: String {
-        guard let date = date else { return id }
-        let formatter = DateFormatter()
-        let cal = Calendar.current
-        if cal.isDateInToday(date) {
-            formatter.dateFormat = "'Today at' h:mm a"
-        } else if cal.isDateInYesterday(date) {
-            formatter.dateFormat = "'Yesterday' h:mm a"
-        } else {
-            formatter.dateFormat = "MMM d, h:mm a"
-        }
-        return formatter.string(from: date)
     }
 }
 
-private struct ArchivedTranscriptEntry: Identifiable {
-    let id = UUID()
-    let timestamp: String
-    let speaker: String
-    let text: String
+private struct EvidenceSheet: View {
+    let source: SummaryEvidenceSource
+    let speakerName: String?
+    let canPlay: Bool
+    let play: () -> Void
+    let done: () -> Void
 
-    static func parse(_ raw: String) -> [ArchivedTranscriptEntry] {
-        let pattern = #"\*\*\[([^\]]+)\]\s*([^:]+):\*\*\s*(.+)"#
-        let regex = try? NSRegularExpression(pattern: pattern)
-        return raw.split(separator: "\n").compactMap { line in
-            let value = String(line)
-            let range = NSRange(value.startIndex..., in: value)
-            guard let match = regex?.firstMatch(in: value, range: range), match.numberOfRanges == 4,
-                  let time = Range(match.range(at: 1), in: value),
-                  let speaker = Range(match.range(at: 2), in: value),
-                  let text = Range(match.range(at: 3), in: value) else { return nil }
-            return ArchivedTranscriptEntry(timestamp: String(value[time]), speaker: String(value[speaker]), text: String(value[text]))
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Transcript source")
+                .font(SekitiriType.title2)
+            Text([source.timestampText, speakerName].compactMap { $0 }.joined(separator: " · "))
+                .font(SekitiriType.meta)
+                .foregroundStyle(SekitiriColor.terracotta)
+            Text(source.quote)
+                .font(SekitiriType.reading)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("This quotation is preserved from the transcript. Play the recording for the surrounding context.")
+                .font(SekitiriType.caption)
+                .foregroundStyle(SekitiriColor.muted)
+            HStack {
+                if canPlay {
+                    Button(action: play) {
+                        Label("Play from \(source.timestampText ?? "here")", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.skPrimary)
+                }
+                Spacer()
+                Button("Done", action: done).keyboardShortcut(.defaultAction)
+            }
         }
+        .padding(24)
+        .frame(minWidth: 420, idealWidth: 540)
+        .background(SekitiriColor.canvas)
     }
 }
 
@@ -1077,51 +1591,50 @@ private struct ShareMeetingSheet: View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Share meeting")
-                    .font(SekitiriType.display(28))
+                    .font(SekitiriType.title2)
                 Text(item.title)
-                    .font(SekitiriType.body(14, weight: .medium))
+                    .font(SekitiriType.bodyStrong)
                     .foregroundStyle(SekitiriColor.muted)
                 Text("Choose exactly what to include. The meeting stays unchanged.")
-                    .font(SekitiriType.body(12))
+                    .font(SekitiriType.meta)
                     .foregroundStyle(SekitiriColor.muted)
             }
 
             VStack(spacing: 0) {
-                ShareOptionRow(title: "Summary", detail: "Decisions, context, and open questions", isOn: $includeSummary)
+                ShareOptionRow(title: "Summary", detail: "Decisions, context and open questions", isOn: $includeSummary)
+                Divider()
                 ShareOptionRow(title: "Transcript", detail: "Timestamped transcript with speaker labels", isOn: $includeTranscript)
+                Divider()
                 ShareOptionRow(title: "Action Items", detail: "Follow-up tasks and completion state", isOn: $includeActionItems)
             }
-            .background(SekitiriColor.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(SekitiriColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(SekitiriColor.line))
 
             if !errorMessage.isEmpty {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                    .font(SekitiriType.body(11))
-                    .foregroundStyle(.red)
+                    .font(SekitiriType.meta)
+                    .foregroundStyle(SekitiriColor.warning)
             }
             if !resultMessage.isEmpty {
                 Label(resultMessage, systemImage: "checkmark.circle.fill")
-                    .font(SekitiriType.body(11))
+                    .font(SekitiriType.meta)
                     .foregroundStyle(SekitiriColor.terracotta)
             }
 
             HStack(spacing: 10) {
                 Button("Cancel") { dismiss() }
-                    .buttonStyle(.bordered)
+                    .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Copy selected") { copySelected() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(SekitiriColor.terracotta)
+                Button("Copy Selected") { copySelected() }
                     .disabled(!hasSelection)
                 Button("Export Markdown…") { exportSelected() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(SekitiriColor.terracotta)
+                    .buttonStyle(.skPrimary)
                     .disabled(!hasSelection)
             }
         }
-        .padding(28)
-        .frame(width: 560)
-        .background(SekitiriColor.sidebar)
+        .padding(24)
+        .frame(width: 540)
+        .background(SekitiriColor.canvas)
     }
 
     private func copySelected() {
@@ -1188,13 +1701,14 @@ private struct ShareOptionRow: View {
 
     var body: some View {
         Toggle(isOn: $isOn) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(SekitiriType.body(13, weight: .medium))
-                Text(detail).font(SekitiriType.body(11)).foregroundStyle(SekitiriColor.muted)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(SekitiriType.bodyStrong)
+                Text(detail).font(SekitiriType.meta).foregroundStyle(SekitiriColor.muted)
             }
         }
         .toggleStyle(.checkbox)
         .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

@@ -10,24 +10,46 @@ actor TranscriptionCoordinator {
         let speaker: String
         let start: TimeInterval
         let text: String
+        var end: TimeInterval = 0
+        var isMicrophone = false
+    }
+    /// Work done for the meeting currently being finalised. `fraction` covers
+    /// recognition of all tracks; the speaker stage follows when enabled.
+    struct Progress: Sendable, Equatable {
+        enum Stage: Sendable, Equatable { case transcribing, identifyingSpeakers }
+        var stage: Stage
+        var fraction: Double
+        var secondsRemaining: TimeInterval?
     }
     enum Status: Sendable {
         case idle
         case transcribing(session: String, queued: Int)
+        case progress(session: String, Progress)
         case ready(session: String, issues: [String])
         case failed(session: String, message: String)
     }
     private struct Settings: Codable, Sendable {
         let engine: String
         let language: String
+        /// Names and terms to favour for this meeting: the user's glossary
+        /// plus calendar attendees. Absent in sessions recorded before.
+        var vocabulary: [String]? = nil
         static func load(in directory: URL) throws -> Self {
             let url = directory.appendingPathComponent("transcription-settings.json")
             if FileManager.default.fileExists(atPath: url.path) {
                 return try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
             }
-            let value = Self(engine: Config.transcriptionEngine(), language: Config.transcriptionLanguage())
+            let value = Self(engine: Config.transcriptionEngine(), language: Config.transcriptionLanguage(),
+                             vocabulary: Config.transcriptionVocabulary(attendees: Self.attendees(in: directory)))
             try JSONEncoder().encode(value).write(to: url, options: .atomic)
             return value
+        }
+
+        private static func attendees(in directory: URL) -> [String] {
+            let url = directory.appendingPathComponent("meta.json")
+            guard let data = try? Data(contentsOf: url),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+            return object["attendees"] as? [String] ?? []
         }
     }
     private var queue: [URL] = []
@@ -47,8 +69,7 @@ actor TranscriptionCoordinator {
     private var backgroundGeneration = 0
 
     init(engineFactory: @escaping @Sendable (String, String) -> any WindowedTranscriptionEngine = { name, language in
-        ParakeetEngine(version: ["parakeet", "parakeet-v2"].contains(name.lowercased()) ? .v2 : .v3,
-                       languageCode: language)
+        ParakeetEngine(version: ParakeetEngine.version(forEngine: name), languageCode: language)
     }, runHooks: Bool = true,
          transcriptionEnabled: @escaping @Sendable () -> Bool = { Config.transcriptionEnabled() },
          speakerEnrichmentEnabled: @escaping @Sendable () -> Bool = { Config.speakerDiarizationEnabled() }) {
@@ -148,12 +169,13 @@ actor TranscriptionCoordinator {
                                                         sources: track.files, settings: settings, engine: engine)
                         // One window per track each turn keeps both sides of a
                         // conversation moving, even after a temporary backlog.
-                        if let window = TranscriptionWindow.next(after: checkpoint.completedThrough,
-                                                                 available: checkpoint.duration, final: false) {
-                            try await recognize(window, sources: track.files, engine: engine,
+                        if let plan = try await engine.planWindow(sourceURLs: track.files,
+                                                                  after: checkpoint.completedThrough,
+                                                                  available: checkpoint.duration, final: false) {
+                            try await recognize(plan, sources: track.files, engine: engine,
                                                 checkpoint: &checkpoint, directory: session.dir, track: track.name)
                             latest[track.name] = liveSegments(checkpoint.segments, track: track.name, offsetMs: track.offsetMs)
-                            onUpdate(latest.values.flatMap { $0 }.sorted { $0.start < $1.start })
+                            onUpdate(Self.withoutEcho(latest.values.flatMap { $0 }.sorted { $0.start < $1.start }))
                             onStatus("Recording · transcript sections saved locally")
                             if TranscriptionWindow.next(after: checkpoint.completedThrough,
                                                         available: checkpoint.duration, final: false) != nil {
@@ -261,6 +283,14 @@ actor TranscriptionCoordinator {
         var recognized: [(track: SessionMeta.Track, audio: URL, segments: [TranscriptSegment])] = []
         var outcomes: [Transcript.TrackOutcome] = []
         let sources = recordedSources(in: directory)
+        var progress = ProgressTracker()
+        for track in meta.tracks {
+            let trackName = track.speaker == "me" ? "mic" : "system"
+            let files = sources[trackName] ?? [directory.appendingPathComponent(track.file)]
+            if let duration = try? AudioWindowReader.duration(of: files) {
+                progress.totals[trackName] = duration
+            }
+        }
         for track in meta.tracks {
             try Task.checkCancellation()
             let audio = directory.appendingPathComponent(track.file)
@@ -276,11 +306,15 @@ actor TranscriptionCoordinator {
             do {
                 var checkpoint = try checkpoint(in: directory, track: trackName,
                                                 sources: files, settings: settings, engine: engine)
-                while let window = TranscriptionWindow.next(after: checkpoint.completedThrough,
-                                                            available: checkpoint.duration, final: true) {
+                while let plan = try await engine.planWindow(sourceURLs: files,
+                                                             after: checkpoint.completedThrough,
+                                                             available: checkpoint.duration, final: true) {
                     try Task.checkCancellation()
-                    try await recognize(window, sources: files, engine: engine,
-                                        checkpoint: &checkpoint, directory: directory, track: trackName)
+                    let audioDone = try await recognize(plan, sources: files, engine: engine,
+                                                        checkpoint: &checkpoint, directory: directory, track: trackName)
+                    progress.record(track: trackName, completed: checkpoint.completedThrough,
+                                    processedAudio: audioDone)
+                    publish(.progress(session: directory.lastPathComponent, progress.snapshot))
                 }
                 recognized.append((track: track, audio: audio, segments: checkpoint.segments))
                 outcomes.append(.init(file: track.file, status: .complete, segmentCount: checkpoint.segments.count))
@@ -302,18 +336,28 @@ actor TranscriptionCoordinator {
         for item in recognized {
             try Task.checkCancellation()
             let offset = TimeInterval(item.track.offsetMs) / 1000
+            func ms(_ seconds: TimeInterval) -> Int { Int((max(0, seconds) + offset) * 1000) }
             // The transcript itself is never blocked on speaker models. Keep
             // accurate source-track labels; optional enrichment can run later.
-            merged += item.segments.map {
-                Transcript.Segment(speaker: item.track.speaker,
-                                   start_ms: Int((max(0, $0.start) + offset) * 1000),
-                                   end_ms: Int((max($0.start, $0.end) + offset) * 1000), text: $0.text)
+            merged += item.segments.map { segment in
+                Transcript.Segment(
+                    speaker: item.track.speaker,
+                    start_ms: ms(segment.start), end_ms: ms(max(segment.start, segment.end)), text: segment.text,
+                    words: segment.words.map { words in
+                        words.map { Transcript.Word(text: $0.text, start_ms: ms($0.start),
+                                                    end_ms: ms(max($0.start, $0.end)), confidence: $0.confidence) }
+                    })
             }
         }
         merged.sort { $0.start_ms < $1.start_ms }
+        let echo = EchoSuppression.split(merged)
+        if !echo.suppressed.isEmpty {
+            log(directory, "suppressed \(echo.suppressed.count) microphone segments repeating system audio")
+        }
         let transcript = Transcript(engine: engineName, model: engineModel,
                                     created_at: ISO8601DateFormatter().string(from: Date()),
-                                    segments: merged, trackOutcomes: outcomes, issues: meta.issues)
+                                    segments: echo.kept, trackOutcomes: outcomes, issues: meta.issues,
+                                    suppressedSegments: echo.suppressed)
         try transcript.write(to: directory)
         log(directory, "saved \(merged.count) segments; complete=\(transcript.isComplete)")
         // Retain short source files while a retry could use their checkpoints.
@@ -346,22 +390,47 @@ actor TranscriptionCoordinator {
                                          language: settings.language)
     }
 
-    private func recognize(_ window: TranscriptionWindow, sources: [URL], engine: any WindowedTranscriptionEngine,
-                           checkpoint: inout TranscriptionCheckpoint, directory: URL, track: String) async throws {
+    /// Recognize one planned window and commit it. Windows that voice
+    /// activity detection found silent are committed without decoding.
+    /// Returns the seconds of audio this call covered.
+    @discardableResult
+    private func recognize(_ plan: WindowPlan, sources: [URL], engine: any WindowedTranscriptionEngine,
+                           checkpoint: inout TranscriptionCheckpoint, directory: URL, track: String) async throws -> TimeInterval {
+        let window = plan.window
         let started = ContinuousClock.now
-        let segments = try await engine.transcribeWindow(sourceURLs: sources, start: window.readStart,
-                                                        duration: window.readEnd - window.readStart,
-                                                        retaining: window.coreStart..<window.coreEnd)
+        let segments = plan.hasSpeech
+            ? try await engine.transcribeWindow(sourceURLs: sources, start: window.readStart,
+                                                duration: window.readEnd - window.readStart,
+                                                retaining: window.coreStart..<window.coreEnd)
+            : []
         try Task.checkCancellation()
         try checkpoint.append(segments, for: window,
                               savingTo: TranscriptionCheckpoint.url(in: directory, track: track))
-        log(directory, "\(track) \(Int(window.coreStart))–\(Int(window.coreEnd))s saved in \(started.duration(to: .now))")
+        let detail = plan.hasSpeech ? "saved" : "silent, skipped"
+        log(directory, "\(track) \(String(format: "%.1f", window.coreStart))–\(String(format: "%.1f", window.coreEnd))s \(detail) in \(started.duration(to: .now))")
+        return window.coreEnd - window.coreStart
     }
 
     private func liveSegments(_ segments: [TranscriptSegment], track: String, offsetMs: Int) -> [LiveSegment] {
         segments.enumerated().map { index, segment in
             LiveSegment(id: "\(track)-\(index)", speaker: track == "mic" ? "You" : "Other participants",
-                        start: segment.start + Double(offsetMs) / 1000, text: segment.text)
+                        start: segment.start + Double(offsetMs) / 1000, text: segment.text,
+                        end: segment.end + Double(offsetMs) / 1000, isMicrophone: track == "mic")
+        }
+    }
+
+    /// Live text gets the same echo filter as the final transcript, so
+    /// speaker playback does not appear twice while recording.
+    static func withoutEcho(_ segments: [LiveSegment]) -> [LiveSegment] {
+        let system = segments.filter { !$0.isMicrophone }.map {
+            Transcript.Segment(speaker: "them", start_ms: Int($0.start * 1000), end_ms: Int($0.end * 1000), text: $0.text)
+        }
+        guard !system.isEmpty else { return segments }
+        return segments.filter { segment in
+            guard segment.isMicrophone else { return true }
+            let mic = Transcript.Segment(speaker: "me", start_ms: Int(segment.start * 1000),
+                                         end_ms: Int(segment.end * 1000), text: segment.text)
+            return !EchoSuppression.isEcho(mic, system: system)
         }
     }
 
@@ -383,7 +452,12 @@ actor TranscriptionCoordinator {
 
     private func preparedEngine(_ settings: Settings) async throws -> any WindowedTranscriptionEngine {
         if let engine, engineSettings?.engine == settings.engine,
-           engineSettings?.language == settings.language { return engine }
+           engineSettings?.language == settings.language {
+            if let configurable = engine as? any VocabularyConfigurable {
+                await configurable.setVocabulary(settings.vocabulary ?? [])
+            }
+            return engine
+        }
         await releaseASR()
         let engine = engineFactory(settings.engine, settings.language)
         do {
@@ -395,6 +469,9 @@ actor TranscriptionCoordinator {
         }
         self.engine = engine
         engineSettings = settings
+        if let configurable = engine as? any VocabularyConfigurable {
+            await configurable.setVocabulary(settings.vocabulary ?? [])
+        }
         return engine
     }
 
@@ -423,23 +500,22 @@ actor TranscriptionCoordinator {
         guard transcript.segments.contains(where: { $0.speaker == "them" }) else { return }
         let meta = try SessionMeta.read(from: directory)
         guard let track = meta.tracks.first(where: { $0.speaker == "them" }) else { return }
+        publish(.progress(session: directory.lastPathComponent,
+                          Progress(stage: .identifyingSpeakers, fraction: 1, secondsRemaining: nil)))
         let spans = await diarizationSpans(for: directory.appendingPathComponent(track.file), directory: directory)
         diarizer?.cleanup()
         diarizer = nil
         try Task.checkCancellation()
         guard !spans.isEmpty else { return }
         let offset = Double(track.offsetMs) / 1000
-        let enriched = transcript.segments.map { segment -> Transcript.Segment in
-            guard segment.speaker == "them" else { return segment }
-            let relative = TranscriptSegment(start: Double(segment.start_ms) / 1000 - offset,
-                                             end: Double(segment.end_ms) / 1000 - offset,
-                                             text: segment.text)
-            return Transcript.Segment(speaker: speakerLabel(for: relative, fallback: "them", spans: spans),
-                                      start_ms: segment.start_ms, end_ms: segment.end_ms, text: segment.text)
+        let enriched = transcript.segments.flatMap { segment -> [Transcript.Segment] in
+            guard segment.speaker == "them" else { return [segment] }
+            return SpeakerAttribution.assign(segment, spans: spans, offset: offset, fallback: "them")
         }
         let result = Transcript(engine: transcript.engine, model: transcript.model,
                                 created_at: transcript.created_at, segments: enriched,
-                                trackOutcomes: transcript.trackOutcomes, issues: transcript.issues)
+                                trackOutcomes: transcript.trackOutcomes, issues: transcript.issues,
+                                suppressedSegments: transcript.suppressedSegments)
         try result.write(to: directory)
     }
 
@@ -451,7 +527,7 @@ actor TranscriptionCoordinator {
             return timeline.speakers.values.flatMap { speaker in
                 (speaker.finalizedSegments + speaker.tentativeSegments).map {
                     SpeakerSpan(
-                        speaker: "Speaker \(speaker.index)",
+                        speaker: "Speaker \(speaker.index + 1)",
                         start: TimeInterval($0.startTime),
                         end: TimeInterval($0.endTime)
                     )
@@ -461,20 +537,6 @@ actor TranscriptionCoordinator {
             log(directory, "speaker diarization unavailable for \(audio.lastPathComponent): \(error)")
             return []
         }
-    }
-
-    private func speakerLabel(
-        for segment: TranscriptSegment,
-        fallback: String,
-        spans: [SpeakerSpan]
-    ) -> String {
-        guard !spans.isEmpty else { return fallback }
-        let best = spans
-            .map { span in
-                (span, max(0, min(segment.end, span.end) - max(segment.start, span.start)))
-            }
-            .max { $0.1 < $1.1 }
-        return best.map { $0.1 > 0 ? $0.0.speaker : fallback } ?? fallback
     }
 
     /// Fires the configured on_stop shell command with the session directory
@@ -502,6 +564,33 @@ actor TranscriptionCoordinator {
             try? handle.close()
         } else {
             try? Data(line.utf8).write(to: url)
+        }
+    }
+
+    /// Recognition progress across a meeting's tracks, with a time estimate
+    /// from the speed measured so far in this run.
+    private struct ProgressTracker {
+        var totals: [String: TimeInterval] = [:]
+        var completed: [String: TimeInterval] = [:]
+        let started = ContinuousClock.now
+        var processed: TimeInterval = 0
+
+        mutating func record(track: String, completed through: TimeInterval, processedAudio: TimeInterval) {
+            completed[track] = through
+            processed += processedAudio
+        }
+
+        var snapshot: Progress {
+            let total = totals.values.reduce(0, +)
+            let done = completed.reduce(0) { $0 + min($1.value, totals[$1.key] ?? $1.value) }
+            let fraction = total > 0 ? min(1, done / total) : 0
+            let elapsed = started.duration(to: .now)
+            let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+            var remaining: TimeInterval?
+            if processed >= 20, seconds > 0 {
+                remaining = max(0, total - done) / (processed / seconds)
+            }
+            return Progress(stage: .transcribing, fraction: fraction, secondsRemaining: remaining)
         }
     }
 

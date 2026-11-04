@@ -2,8 +2,10 @@
 
 Sekitiri is a native macOS meeting recorder and note-taking app. Recording,
 transcription, and summaries run in-process. Audio recognition uses local
-Parakeet models through FluidAudio; Parakeet v3 is the multilingual default.
-The same checkpointed transcription work runs during recording and after Stop.
+Parakeet models through FluidAudio; Parakeet Ultra is the multilingual default
+on fresh installs (Macs with v3 cached keep v3 until upgraded in Settings).
+Windows are planned at pauses with voice activity detection, and the same
+checkpointed transcription work runs during recording and after Stop.
 
 The notes selector offers **Source notes · lightweight** (the default for a
 fresh installation), Apple's on-device Foundation Model and Qwen3.5 2B 4-bit
@@ -197,3 +199,22 @@ not offer edits that the current classification pipeline would ignore.
 
 ## UI spec
 Design in progress: `~/Projects/quillnotes-app/Figma-BRIEF.md`.
+
+The interface follows the editorial redesign (palette A): tokens, type and
+shared components live in `Sources/SekitiriTheme.swift` and
+`Sources/SekitiriLayout.swift`. Newsreader and IBM Plex Sans ship in
+`Sources/Assets/Fonts` (SIL Open Font License, licence files alongside) and
+are registered for the app process at launch; `Tools/build_app.sh` copies them
+to `Contents/Resources/Fonts`. Without them the app falls back to New York and
+SF at the same sizes.
+
+### Visual checks without screen recording
+Set `SEKITIRI_SNAPSHOT_DIR` to have the app render screens to PNG and quit:
+
+```sh
+SEKITIRI_SNAPSHOT_DIR=/tmp/shots SEKITIRI_SNAPSHOT_SECTIONS=dashboard,meetings,meeting,record,settings,menubar,mini \
+SEKITIRI_SNAPSHOT_SIZE=1440x1000 SEKITIRI_SNAPSHOT_APPEARANCE=dark \
+  .local-validation/Sekitiri.app/Contents/MacOS/Sekitiri
+```
+
+Nothing in `Sources/DevSnapshot.swift` runs unless that variable is set.

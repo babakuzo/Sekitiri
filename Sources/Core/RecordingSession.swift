@@ -40,11 +40,10 @@ final class RecordingSession: @unchecked Sendable {
     /// signal for safe auto-end detection only; raw samples never leave the
     /// recorder through this callback.
     var onAudioActivityChange: ((Bool) -> Void)?
-    /// Copied mono microphone PCM for the live transcription pipeline. This
-    /// is deliberately separate from the durable recording files.
-    var onLiveAudioChunk: (@Sendable (LiveAudioChunk) -> Void)? {
-        didSet { mic.onLiveAudioChunk = onLiveAudioChunk }
-    }
+    /// Microphone-only activity, reported about once per second on the main
+    /// queue. Lets the UI warn when the mic itself has gone silent while
+    /// other participants are still audible through system audio.
+    var onMicActivityChange: ((Bool) -> Void)?
     let dir: URL
     let startedAt = Date()
 
@@ -129,12 +128,12 @@ final class RecordingSession: @unchecked Sendable {
             self?.publishHealth()
         }
         mic.onAudioActivity = { [weak self] active in
+            self?.onMicActivityChange?(active)
             self?.publishAudioActivity(active)
         }
         system.onAudioActivity = { [weak self] active in
             self?.publishAudioActivity(active)
         }
-        mic.onLiveAudioChunk = onLiveAudioChunk
     }
 
     /// Start the required microphone first, then attempt optional system

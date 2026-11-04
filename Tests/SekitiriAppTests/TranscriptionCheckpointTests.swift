@@ -47,9 +47,10 @@ struct TranscriptionCheckpointTests {
             let restored = try open(cache, [first, second])
             #expect(restored.sources.count == 2)
             #expect(restored.duration == 60)
-            #expect(restored.completedThrough == 26)
+            #expect(restored.completedThrough == TranscriptionWindow.coreDuration)
             #expect(restored.segments.map(\.text) == ["Bonjour, let's begin."])
-            #expect(TranscriptionWindow.next(after: restored.completedThrough, available: restored.duration, final: false)?.coreStart == 26)
+            #expect(TranscriptionWindow.next(after: restored.completedThrough, available: restored.duration, final: false)?.coreStart
+                == TranscriptionWindow.coreDuration)
         }
     }
 
@@ -72,13 +73,17 @@ struct TranscriptionCheckpointTests {
     }
 
     @Test("Background recognition waits for complete core and right context")
-    func waitsForContext() {
-        #expect(TranscriptionWindow.next(after: 0, available: 27.9, final: false) == nil)
-        #expect(TranscriptionWindow.next(after: 26, available: 53.9, final: false) == nil)
-        #expect(TranscriptionWindow.next(after: 0, available: 28, final: false)
-            == TranscriptionWindow(coreStart: 0, coreEnd: 26, readStart: 0, readEnd: 28))
-        #expect(TranscriptionWindow.next(after: 26, available: 54, final: false)
-            == TranscriptionWindow(coreStart: 26, coreEnd: 52, readStart: 24, readEnd: 54))
+    func waitsForContext() throws {
+        let core = TranscriptionWindow.coreDuration
+        let context = TranscriptionWindow.contextDuration
+        #expect(TranscriptionWindow.next(after: 0, available: core + context - 0.1, final: false) == nil)
+        #expect(TranscriptionWindow.next(after: 20, available: 20 + core + context - 0.1, final: false) == nil)
+        #expect(TranscriptionWindow.next(after: 0, available: core + context, final: false)
+            == TranscriptionWindow(coreStart: 0, coreEnd: core, readStart: 0, readEnd: core + context))
+        let later = try #require(TranscriptionWindow.next(after: 20, available: 40, final: false))
+        #expect(later.coreStart == 20 && abs(later.coreEnd - (20 + core)) < 0.0001)
+        #expect(later.readStart == 20 - context && abs(later.readEnd - (20 + core + context)) < 0.0001)
+        #expect(later.readEnd - later.readStart < 15, "each window must fit one 15 s encoder pass")
         #expect(TranscriptionWindow.next(after: 26, available: 26, final: true) == nil)
         #expect(TranscriptionWindow.next(after: .nan, available: 30, final: true) == nil)
         #expect(TranscriptionWindow.next(after: 0, available: .infinity, final: true) == nil)
@@ -90,11 +95,14 @@ struct TranscriptionCheckpointTests {
             try writeAudio(first, seconds: 26.05)
             let cache = TranscriptionCheckpoint.url(in: directory, track: "mic")
             var checkpoint = try open(cache, [first])
-            let firstWindow = try #require(TranscriptionWindow.next(after: 0, available: checkpoint.duration, final: true))
-            try checkpoint.append([], for: firstWindow, savingTo: cache)
+            while let window = TranscriptionWindow.next(after: checkpoint.completedThrough,
+                                                        available: checkpoint.duration, final: true),
+                  window.coreEnd < 26 {
+                try checkpoint.append([], for: window, savingTo: cache)
+            }
             let tail = try #require(TranscriptionWindow.next(after: checkpoint.completedThrough, available: checkpoint.duration, final: true))
             #expect(abs(tail.coreEnd - 26.05) < 0.0001)
-            #expect(tail.readStart == 24)
+            #expect(abs(tail.readStart - (tail.coreStart - TranscriptionWindow.contextDuration)) < 0.0001)
             try checkpoint.append([TranscriptSegment(start: 26.01, end: 26.04, text: "Oui.")], for: tail, savingTo: cache)
             let restored = try open(cache, [first])
             #expect(abs(restored.completedThrough - 26.05) < 0.0001)

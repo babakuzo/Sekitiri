@@ -172,6 +172,13 @@ enum MeetingNotesService {
         try NativeMeetingStore.saveIndex(config, index)
     }
 
+    /// The notes vault folder, as configured in
+    /// `~/.config/meeting-notes/config.json` (default `~/Meetings`). Read-only
+    /// helper for the UI; it never changes where notes are written.
+    static func meetingsDirectory() -> URL {
+        NativeMeetingStore.meetingsDirectory((try? NativeNotesConfigStore.load()) ?? .default)
+    }
+
     static func summaryPrompt() async throws -> String {
         try NativeNotesConfigStore.load().promptTemplate
     }
@@ -218,6 +225,53 @@ enum MeetingNotesService {
             try NativeMeetingStore.saveIndex(config, index)
         }
         if fm.fileExists(atPath: session.path) { try fm.removeItem(at: session) }
+    }
+
+    /// What `trashMeeting` moved, so the delete can be undone.
+    struct TrashedMeeting: Sendable {
+        fileprivate let moves: [(original: URL, trashed: URL)]
+        fileprivate let removedEntries: Data
+    }
+
+    /// Like `deleteMeeting`, but moves the folders to the Trash and keeps
+    /// enough to put everything back with `restore`.
+    static func trashMeeting(for session: URL) throws -> TrashedMeeting {
+        let fm = FileManager.default
+        let source = session.standardizedFileURL.path
+        let config = try NativeNotesConfigStore.load()
+        var index = try NativeMeetingStore.loadIndex(config)
+        let isMatch: (NativeMeeting) -> Bool = {
+            $0.sourceSessionDir.map { URL(fileURLWithPath: $0).standardizedFileURL.path == source } ?? false
+        }
+        let matches = index.meetings.filter(isMatch)
+        var folders = matches.map { NativeMeetingStore.meetingFolder(config, id: $0.id) }
+        folders.append(session)
+        var moves: [(original: URL, trashed: URL)] = []
+        for folder in folders where fm.fileExists(atPath: folder.path) {
+            var trashed: NSURL?
+            try fm.trashItem(at: folder, resultingItemURL: &trashed)
+            if let trashed = trashed as URL? { moves.append((folder, trashed)) }
+        }
+        if !matches.isEmpty {
+            index.meetings.removeAll(where: isMatch)
+            try NativeMeetingStore.saveIndex(config, index)
+        }
+        return TrashedMeeting(moves: moves, removedEntries: try JSONEncoder().encode(matches))
+    }
+
+    /// Moves trashed folders back and re-adds their index entries.
+    static func restore(_ trashed: TrashedMeeting) throws {
+        let fm = FileManager.default
+        for move in trashed.moves where fm.fileExists(atPath: move.trashed.path) && !fm.fileExists(atPath: move.original.path) {
+            try fm.moveItem(at: move.trashed, to: move.original)
+        }
+        let entries = try JSONDecoder().decode([NativeMeeting].self, from: trashed.removedEntries)
+        guard !entries.isEmpty else { return }
+        let config = try NativeNotesConfigStore.load()
+        var index = try NativeMeetingStore.loadIndex(config)
+        let existing = Set(index.meetings.map(\.id))
+        index.meetings += entries.filter { !existing.contains($0.id) }
+        try NativeMeetingStore.saveIndex(config, index)
     }
 
     private static func replaceCopy(_ source: URL, _ destination: URL) throws {
