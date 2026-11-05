@@ -109,6 +109,31 @@ struct TranscriptIntegrityTests {
         #expect(TranscriptIntegrity.isComplete(at: directory))
     }
 
+    @Test("Audio can be trashed and restored without touching the transcript")
+    func trashAndRestoreAudio() throws {
+        let directory = try session()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audio = directory.appendingPathComponent("mic.caf")
+        let segment = directory.appendingPathComponent("segments/mic/000001.caf")
+        try FileManager.default.createDirectory(at: segment.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("placeholder audio".utf8).write(to: audio)
+        try Data("placeholder segment".utf8).write(to: segment)
+        // Audio an unfinished transcript still needs is never removed
+        #expect(throws: MeetingNotesService.ServiceError.self) { try MeetingNotesService.trashAudio(for: directory) }
+        #expect(MeetingNotesService.hasAudio(in: directory))
+
+        try transcript().write(to: directory)
+        let transcriptJSON = try Data(contentsOf: directory.appendingPathComponent("transcript.json"))
+        let trashed = try MeetingNotesService.trashAudio(for: directory)
+        #expect(!MeetingNotesService.hasAudio(in: directory))
+        #expect(TranscriptIntegrity.isComplete(at: directory))
+        #expect(try Data(contentsOf: directory.appendingPathComponent("transcript.json")) == transcriptJSON)
+
+        try MeetingNotesService.restore(trashed)
+        #expect(FileManager.default.fileExists(atPath: audio.path))
+        #expect(FileManager.default.fileExists(atPath: segment.path))
+    }
+
     @Test("Deleting original audio does not invalidate committed text")
     func deletedAudioRemainsComplete() throws {
         let directory = try session()

@@ -486,15 +486,33 @@ final class AppModel: ObservableObject {
 
     func deleteCompletedAudio() {
         guard let directory = lastCompletedSessionDirectory else { return }
+        deleteAudio(session: directory)
+    }
+
+    /// Moves a meeting's original audio to the Trash. Its transcript, notes
+    /// and action items stay; the toast's Undo puts the audio back.
+    @discardableResult
+    func deleteAudio(session directory: URL) -> Bool {
         guard !isTranscribing, TranscriptIntegrity.isComplete(at: directory) else {
             setStatus("Finish or retry transcription before deleting its source audio.", tone: .warning)
-            return
+            return false
         }
         do {
-            try MeetingNotesService.deleteAudio(for: directory)
-            setStatus("Audio deleted — transcript and notes are kept")
+            let trashed = try MeetingNotesService.trashAudio(for: directory)
+            archiveRevision &+= 1
+            showToast("Audio moved to the Trash. Transcript and notes are kept.") { [weak self] in
+                do {
+                    try MeetingNotesService.restore(trashed)
+                    self?.archiveRevision &+= 1
+                    self?.showToast("Audio restored")
+                } catch {
+                    self?.showToast("Couldn’t restore the audio. It’s still in the Trash.")
+                }
+            }
+            return true
         } catch {
             setStatus("Couldn’t delete audio: \(error.localizedDescription)", tone: .warning)
+            return false
         }
     }
 

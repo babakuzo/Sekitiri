@@ -189,19 +189,41 @@ enum MeetingNotesService {
         try NativeNotesConfigStore.save(config)
     }
 
-    /// Removes only the original capture tracks. Any transcript, summary,
-    /// additional notes, and action items remain available locally.
-    static func deleteAudio(for session: URL) throws {
+    /// What `trashAudio` moved, so the deletion can be undone.
+    struct TrashedAudio: Sendable {
+        fileprivate let moves: [(original: URL, trashed: URL)]
+    }
+
+    /// Moves only the original capture tracks to the Trash. Any transcript,
+    /// summary, additional notes, and action items remain available locally.
+    static func trashAudio(for session: URL) throws -> TrashedAudio {
         guard TranscriptIntegrity.isComplete(at: session) else {
             throw ServiceError.failed("Finish or retry transcription before deleting the source audio it still needs.")
         }
         let fm = FileManager.default
-        for filename in ["mic.caf", "system.caf"] {
-            let url = session.appendingPathComponent(filename)
-            if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+        var moves: [(original: URL, trashed: URL)] = []
+        for name in ["mic.caf", "system.caf", "segments"] {
+            let url = session.appendingPathComponent(name)
+            guard fm.fileExists(atPath: url.path) else { continue }
+            var trashed: NSURL?
+            try fm.trashItem(at: url, resultingItemURL: &trashed)
+            if let trashed = trashed as URL? { moves.append((url, trashed)) }
         }
-        let segments = session.appendingPathComponent("segments", isDirectory: true)
-        if fm.fileExists(atPath: segments.path) { try fm.removeItem(at: segments) }
+        return TrashedAudio(moves: moves)
+    }
+
+    /// Moves trashed audio back into its session folder.
+    static func restore(_ trashed: TrashedAudio) throws {
+        let fm = FileManager.default
+        for move in trashed.moves where fm.fileExists(atPath: move.trashed.path) && !fm.fileExists(atPath: move.original.path) {
+            try fm.moveItem(at: move.trashed, to: move.original)
+        }
+    }
+
+    static func hasAudio(in session: URL) -> Bool {
+        ["mic.caf", "system.caf", "segments"].contains {
+            FileManager.default.fileExists(atPath: session.appendingPathComponent($0).path)
+        }
     }
 
     /// Removes the capture folder and the matching meeting material in the

@@ -455,8 +455,13 @@ private struct MeetingArchiveView: View {
                                     Button("Show in Finder") {
                                         NSWorkspace.shared.activateFileViewerSelecting([item.url])
                                     }
-                                    if item.sourceSession != nil {
+                                    if let session = item.sourceSession {
                                         Divider()
+                                        if item.status != .needsAttention, MeetingNotesService.hasAudio(in: session) {
+                                            Button("Delete Audio, Keep Transcript", role: .destructive) {
+                                                model.deleteAudio(session: session)
+                                            }
+                                        }
                                         Button("Move to Trash", role: .destructive) { delete(item) }
                                     }
                                 }
@@ -744,6 +749,10 @@ struct MeetingDetailView: View {
         .onChange(of: model.isTranscribing) { _, processing in
             if !processing, notesSaveError == nil { load() }
         }
+        .onChange(of: model.archiveRevision) { _, _ in
+            // Audio can be trashed or restored from here or the archive.
+            trackURLs = item.loadRecordingTrackURLs()
+        }
         .onChange(of: playback.duration) { _, duration in
             guard duration > 0, let target = pendingSeek else { return }
             pendingSeek = nil
@@ -811,6 +820,21 @@ struct MeetingDetailView: View {
                         Label("Share", systemImage: "square.and.arrow.up")
                     }
                     .buttonStyle(.skOutline)
+                }
+                if let session = item.sourceSession, !trackURLs.isEmpty {
+                    Menu {
+                        Button("Delete Audio, Keep Transcript", role: .destructive) {
+                            playback.stop()
+                            model.deleteAudio(session: session)
+                        }
+                        .disabled(transcriptFailed || transcriptIsProcessing)
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("More")
                 }
             }
             titleRow
