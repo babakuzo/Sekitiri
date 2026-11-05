@@ -44,8 +44,8 @@ enum SekitiriColor {
     static let sage = dynamic(light: 0x5E6D54, dark: 0x9DB08F)
     static let bronze = dynamic(light: 0x75603F, dark: 0xC8A878)
     static let bronzeTint = dynamic(light: 0xEFE5D3, dark: 0x352D20)
-    static let warning = dynamic(light: 0xB3261E, dark: 0xF2867C)
     static let danger = dynamic(light: 0xB3261E, dark: 0xF2867C)
+    static let warning = danger
     static let dangerText = dynamic(light: 0x8C1D18, dark: 0xF5A39B)
     static let dangerTint = dynamic(light: 0xFCEDEB, dark: 0x3A2220)
     static let dangerBorder = dynamic(light: 0xEBB7B2, dark: 0x6B3530)
@@ -104,7 +104,6 @@ enum SekitiriType {
     static let cardTitle = serif(24, .medium)
     static let subTitle = serif(21, .semibold)
     static let reading = serif(18)
-    static let readingLarge = serif(19)
     static let nav = sans(17, .medium)
     static let body = sans(15)
     static let bodyStrong = sans(15, .semibold)
@@ -114,7 +113,6 @@ enum SekitiriType {
     static let caption = sans(12)
 
     // Semantic aliases kept for existing screens.
-    static let largeTitle = pageTitle
     static let title = sectionTitle
     static let title2 = subTitle
     static let title3 = serif(19, .semibold)

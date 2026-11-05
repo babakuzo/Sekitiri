@@ -11,6 +11,9 @@ struct TranscriptionSettingsSection: View {
     @AppStorage("transcriptionVocabulary") private var vocabulary = ""
     @State private var engine = Config.transcriptionEngine()
     @State private var download: DownloadState = .idle
+    /// Checked when the model changes or a download ends, not on every render
+    /// (download progress and vocabulary typing re-render this section).
+    @State private var modelCached = true
 
     private enum DownloadState: Equatable {
         case idle
@@ -25,7 +28,7 @@ struct TranscriptionSettingsSection: View {
                     Text(option.label).tag(option.rawValue)
                 }
             }
-            if !ParakeetEngine.isCached(engine: engine) {
+            if !modelCached {
                 modelDownloadRow
             }
             LabeledContent("Language", value: "Detected automatically")
@@ -61,6 +64,7 @@ struct TranscriptionSettingsSection: View {
         } footer: {
             Text("Labels other participants as Speaker 1, Speaker 2… after the transcript is ready, and lets you rename them. Downloads a separate speech model the first time. Leave off for lighter processing.")
         }
+        .onAppear { modelCached = ParakeetEngine.isCached(engine: engine) }
     }
 
     private var selectedOption: TranscriptionEngineOption {
@@ -73,6 +77,7 @@ struct TranscriptionSettingsSection: View {
             set: { value in
                 engine = value
                 download = .idle
+                modelCached = ParakeetEngine.isCached(engine: value)
                 UserDefaults.standard.set(value, forKey: "localTranscriptionEngine")
             }
         )
@@ -109,8 +114,7 @@ struct TranscriptionSettingsSection: View {
                     }
                 }
                 await MainActor.run {
-                    // Re-render: the cache check now finds the model.
-                    if engine == name { download = .idle; engine = name }
+                    if engine == name { download = .idle; modelCached = ParakeetEngine.isCached(engine: name) }
                 }
             } catch {
                 await MainActor.run {

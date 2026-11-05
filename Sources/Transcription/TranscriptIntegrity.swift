@@ -226,14 +226,20 @@ struct Transcript: Codable {
     }
 
     private static func clock(_ milliseconds: Int) -> String {
-        let total = max(0, milliseconds) / 1000
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+        TranscriptDocument.clock(TimeInterval(milliseconds / 1000))
     }
 }
 
 enum TranscriptIntegrity {
     static let markerFilename = "transcript.complete.json"
+    /// Written when a session is first transcribed by the current pipeline.
+    static let settingsFilename = "transcription-settings.json"
+
+    /// True for sessions transcribed by the current pipeline, whose capture
+    /// folder holds the authoritative transcript rather than the vault copy.
+    static func isModernSession(_ directory: URL) -> Bool {
+        FileManager.default.fileExists(atPath: directory.appendingPathComponent(settingsFilename).path)
+    }
     static let pendingFilename = "transcript.pending"
     struct Commit: Codable {
         let generationID: String

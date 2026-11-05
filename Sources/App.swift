@@ -68,6 +68,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var toast: AppToast?
     private var toastUndo: (() -> Void)?
     private var toastDismissTask: Task<Void, Never>?
+    private var queuedToasts: [String] = []
     /// Start of the current (or just-finished) recording.
     @Published private(set) var recordingStartedAt: Date?
     @Published private(set) var microphoneTrack: CaptureTrackState = .off
@@ -126,7 +127,6 @@ final class AppModel: ObservableObject {
     private var lastMicSignalAt: Date?
     private var micSendingNothingNotified = false
     nonisolated static let micNoSignalWarningSeconds: TimeInterval = 30
-    private var hasAudioActivity = false
     private var remindedMeetingIDs = Set<String>()
     private var promptedCallIDs = Set<String>()
     private var pausedAt: Date?
@@ -223,7 +223,7 @@ final class AppModel: ObservableObject {
 
     var isCalendarConnected: Bool { calendarAuthorization == .fullAccess }
 
-    func toggleRecording() { recording || isStartingRecording ? stop() : start() }
+    func toggleRecording() { recording || isStartingRecording ? stop() : startIfNotRecording() }
 
     func startIfNotRecording() {
         guard !recording && !isStartingRecording else { return }
@@ -330,16 +330,7 @@ final class AppModel: ObservableObject {
         safetyPromptKeys.removeAll()
         longRecordingReminderMinutes.removeAll()
         recordingSafetyPrompt = nil
-        lastAudioActivityAt = Date()
-        lastMicActivityAt = Date()
-        lastMicSignalAt = Date()
-        micSendingNothingNotified = false
-        hasAudioActivity = false
-        isHearingAudio = false
-        noSoundWarning = false
-        micSilenceWarning = false
-        micSendingNothing = false
-        silenceStopDeadline = nil
+        resetCaptureIndicators(activityAt: Date())
         isStartingRecording = false
         isPaused = false
         pausedDuration = 0
@@ -367,9 +358,11 @@ final class AppModel: ObservableObject {
             }
         }
         newSession.onMicSignal = { [weak self] hasSignal in
-            guard let self, hasSignal, self.recording, !self.isPaused else { return }
-            self.lastMicSignalAt = Date()
-            if self.micSendingNothing { self.micSendingNothing = false }
+            Task { @MainActor [weak self] in
+                guard let self, hasSignal, self.recording, !self.isPaused else { return }
+                self.lastMicSignalAt = Date()
+                if self.micSendingNothing { self.micSendingNothing = false }
+            }
         }
         startLiveTranscription(for: newSession)
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
@@ -397,7 +390,7 @@ final class AppModel: ObservableObject {
         let secs = elapsedDuration(for: session, at: stoppedAt)
         isFinalizingRecording = true
         setStatus("Saving recording…")
-        elapsed = Self.format(secs)
+        elapsed = TranscriptDocument.clock(secs)
         ticker?.invalidate()
         ticker = nil
         _ = persistAdditionalNotes(using: session)
@@ -419,7 +412,7 @@ final class AppModel: ObservableObject {
             self.isPaused = false
             self.showingCompletedRecording = true
             self.recordingMeeting = nil
-            self.resetCaptureIndicators()
+            self.resetCaptureIndicators(activityAt: nil)
             self.recordingCallWasDetected = false
             self.liveTranscriptionSuspendedForResources = false
             self.recordingSafetyPrompt = nil
@@ -485,7 +478,7 @@ final class AppModel: ObservableObject {
             self.isPaused = false
             self.showingCompletedRecording = false
             self.recordingMeeting = nil
-            self.resetCaptureIndicators()
+            self.resetCaptureIndicators(activityAt: nil)
             self.recordingStartedAt = nil
             self.lastCompletedSessionDirectory = nil
             self.liveSegments = []
@@ -584,12 +577,17 @@ final class AppModel: ObservableObject {
         let label = latest.isEmpty ? "Marked moment" : String(latest.prefix(70)) + (latest.count > 70 ? "…" : "")
         markedMoments.append(MarkedMoment(seconds: seconds, label: label))
         MarkedMoment.save(markedMoments, in: session.dir)
-        showToast("Moment marked at \(Self.format(seconds))")
+        showToast("Moment marked at \(TranscriptDocument.clock(seconds))")
     }
 
     // MARK: Toasts
 
     func showToast(_ message: String, undo: (() -> Void)? = nil) {
+        // A plain message waits its turn rather than taking away a pending Undo.
+        if undo == nil, toastUndo != nil {
+            queuedToasts.append(message)
+            return
+        }
         toastDismissTask?.cancel()
         toast = AppToast(message: message, canUndo: undo != nil)
         toastUndo = undo
@@ -604,6 +602,7 @@ final class AppModel: ObservableObject {
         toastDismissTask?.cancel()
         toast = nil
         toastUndo = nil
+        if !queuedToasts.isEmpty { showToast(queuedToasts.removeFirst()) }
     }
 
     func undoToast() {
@@ -628,14 +627,7 @@ final class AppModel: ObservableObject {
         recordingTitle = title
         session?.updateTitle(title)
         guard session == nil, let dir = lastCompletedSessionDirectory else { return }
-        let metaURL = dir.appendingPathComponent("meta.json")
-        guard var meta = (try? Data(contentsOf: metaURL))
-            .flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) else { return }
-        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { meta.removeValue(forKey: "title_override") }
-        else { meta["title_override"] = trimmed }
-        guard let data = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys]) else { return }
-        try? data.write(to: metaURL, options: .atomic)
+        try? MeetingLibrary.setTitleOverride(title, in: dir.appendingPathComponent("meta.json"))
     }
 
     func updateAdditionalNotes(_ notes: String) {
@@ -674,6 +666,7 @@ final class AppModel: ObservableObject {
                 isPaused = false
                 // Paused time is never counted as silence.
                 lastAudioActivityAt = Date()
+                lastMicActivityAt = Date()
                 lastMicSignalAt = Date()
                 setStatus("Recording", tone: .recording)
                 if !liveTranscriptionSuspendedForResources {
@@ -840,11 +833,13 @@ final class AppModel: ObservableObject {
         if localSummaryModelState == .loading { localSummaryModelState = .ready }
     }
 
-    private func resetCaptureIndicators() {
-        lastAudioActivityAt = nil
-        lastMicActivityAt = nil
-        lastMicSignalAt = nil
-        hasAudioActivity = false
+    /// Clears every capture warning. Silence is measured from `activityAt`:
+    /// now when a recording starts, nil once it has ended.
+    private func resetCaptureIndicators(activityAt: Date?) {
+        lastAudioActivityAt = activityAt
+        lastMicActivityAt = activityAt
+        lastMicSignalAt = activityAt
+        micSendingNothingNotified = false
         isHearingAudio = false
         noSoundWarning = false
         micSilenceWarning = false
@@ -884,7 +879,7 @@ final class AppModel: ObservableObject {
     private func tick() {
         guard let session else { return }
         let now = Date()
-        elapsed = Self.format(elapsedDuration(for: session, at: now))
+        elapsed = TranscriptDocument.clock(elapsedDuration(for: session, at: now))
         session.checkpoint()
         protectRecordingFromThermalPressureIfNeeded()
         if isHearingAudio, let last = lastAudioActivityAt, now.timeIntervalSince(last) > 2 {
@@ -967,7 +962,6 @@ final class AppModel: ObservableObject {
 
     private func audioActivityDidChange(_ active: Bool) {
         guard active, recording, !isPaused else { return }
-        hasAudioActivity = true
         lastAudioActivityAt = Date()
         if !isHearingAudio { isHearingAudio = true }
         if noSoundWarning { noSoundWarning = false }
@@ -979,9 +973,6 @@ final class AppModel: ObservableObject {
         activeMeeting = calendarService.activeMeeting
         upcomingMeeting = calendarService.upcomingMeeting
         todaySchedule = calendarService.todaySchedule
-        if calendarAuthorization != calendarService.authorizationStatus {
-            calendarAuthorization = calendarService.authorizationStatus
-        }
         if !recording, !isStartingRecording, draftMeetingTitle.isEmpty {
             draftMeetingTitle = activeMeeting?.title ?? upcomingMeeting?.title ?? ""
         }
@@ -1160,12 +1151,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    static func format(_ interval: TimeInterval) -> String {
-        let total = Int(interval)
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
-    }
-
     private static func relative(_ date: Date) -> String {
         let mins = max(0, Int(date.timeIntervalSinceNow / 60))
         return mins == 0 ? "starting now" : "in \(mins)m"
@@ -1231,7 +1216,7 @@ struct RecordingCommands: Commands {
     var body: some Commands {
         CommandMenu("Recording") {
             Button(model.recording ? "Stop Recording" : model.isStartingRecording ? "Cancel Recording Start" : "Start Recording") {
-                if model.recording || model.isStartingRecording { model.stop() } else { model.startIfNotRecording() }
+                model.toggleRecording()
             }
             .keyboardShortcut("r", modifiers: [.command, .shift])
             .disabled(model.isFinalizingRecording)

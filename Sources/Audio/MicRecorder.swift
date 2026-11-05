@@ -459,6 +459,9 @@ final class MicRecorder: @unchecked Sendable {
 
     private func report(_ next: Health) {
         if case .unavailable(let message) = next {
+            // A device going away after Stop (teardown, a late queued callback)
+            // is not a capture problem and must never flag the recording.
+            guard isRecording else { return }
             issueLock.withLock {
                 if !savedCaptureIssues.contains(message) { savedCaptureIssues.append(message) }
             }

@@ -124,6 +124,20 @@ struct TranscriptQualityTests {
         #expect(output[0].start == 0 && output[0].end == 0.5)
     }
 
+    @Test("A replacement that no longer fits after an earlier one is skipped, not a crash")
+    func vocabularyReplacementPastEnd() throws {
+        let words = ["the", "nvidia", "cards"].enumerated().map {
+            TranscriptWord(text: $1, start: Double($0), end: Double($0) + 0.5, confidence: 0.9)
+        }
+        func result(_ original: String, _ replacement: String) throws -> VocabularyRescorer.RescoringResult {
+            let json = #"{"originalWord":"\#(original)","originalScore":-9,"replacementWord":"\#(replacement)","replacementScore":-2,"shouldReplace":true,"reason":"test"}"#
+            return try JSONDecoder().decode(VocabularyRescorer.RescoringResult.self, from: Data(json.utf8))
+        }
+        // After "nvidia" (index 1), only one word remains for a two-word match.
+        let output = ParakeetEngine.applying([try result("nvidia", "NVIDIA"), try result("cards are", "Cardsare")], to: words)
+        #expect(output.map(\.text) == ["the", "NVIDIA", "cards"])
+    }
+
     @Test("Vocabulary combines glossary and attendee names without emails")
     func vocabularyTerms() {
         let terms = Config.transcriptionVocabulary(attendees: ["Ada Lovelace", "ops@example.com", "Al"])

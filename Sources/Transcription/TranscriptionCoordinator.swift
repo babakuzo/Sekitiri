@@ -35,7 +35,7 @@ actor TranscriptionCoordinator {
         /// plus calendar attendees. Absent in sessions recorded before.
         var vocabulary: [String]? = nil
         static func load(in directory: URL) throws -> Self {
-            let url = directory.appendingPathComponent("transcription-settings.json")
+            let url = directory.appendingPathComponent(TranscriptIntegrity.settingsFilename)
             if FileManager.default.fileExists(atPath: url.path) {
                 return try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
             }
@@ -306,6 +306,8 @@ actor TranscriptionCoordinator {
             do {
                 var checkpoint = try checkpoint(in: directory, track: trackName,
                                                 sources: files, settings: settings, engine: engine)
+                // Work already saved during the meeting or an earlier attempt counts.
+                progress.record(track: trackName, completed: checkpoint.completedThrough, processedAudio: 0)
                 while let plan = try await engine.planWindow(sourceURLs: files,
                                                              after: checkpoint.completedThrough,
                                                              available: checkpoint.duration, final: true) {
@@ -359,7 +361,7 @@ actor TranscriptionCoordinator {
                                     segments: echo.kept, trackOutcomes: outcomes, issues: meta.issues,
                                     suppressedSegments: echo.suppressed)
         try transcript.write(to: directory)
-        log(directory, "saved \(merged.count) segments; complete=\(transcript.isComplete)")
+        log(directory, "saved \(echo.kept.count) segments; complete=\(transcript.isComplete)")
         // Retain short source files while a retry could use their checkpoints.
         // The assembled mic/system files remain available for playback.
         if transcript.isComplete {
@@ -392,7 +394,8 @@ actor TranscriptionCoordinator {
 
     /// Recognize one planned window and commit it. Windows that voice
     /// activity detection found silent are committed without decoding.
-    /// Returns the seconds of audio this call covered.
+    /// Returns the seconds of audio decoded (zero for a silent window), which
+    /// is what the time estimate's speed is measured on.
     @discardableResult
     private func recognize(_ plan: WindowPlan, sources: [URL], engine: any WindowedTranscriptionEngine,
                            checkpoint: inout TranscriptionCheckpoint, directory: URL, track: String) async throws -> TimeInterval {
@@ -408,7 +411,7 @@ actor TranscriptionCoordinator {
                               savingTo: TranscriptionCheckpoint.url(in: directory, track: track))
         let detail = plan.hasSpeech ? "saved" : "silent, skipped"
         log(directory, "\(track) \(String(format: "%.1f", window.coreStart))–\(String(format: "%.1f", window.coreEnd))s \(detail) in \(started.duration(to: .now))")
-        return window.coreEnd - window.coreStart
+        return plan.hasSpeech ? window.coreEnd - window.coreStart : 0
     }
 
     private func liveSegments(_ segments: [TranscriptSegment], track: String, offsetMs: Int) -> [LiveSegment] {

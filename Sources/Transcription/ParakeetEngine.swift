@@ -320,12 +320,9 @@ actor ParakeetEngine: WindowedTranscriptionEngine, VocabularyConfigurable {
         for replacement in replacements where replacement.shouldReplace {
             guard let newText = replacement.replacementWord, !newText.isEmpty else { continue }
             let original = replacement.originalWord.split(separator: " ").map { key(String($0)) }
-            guard !original.isEmpty, output.count >= original.count else { continue }
-            var found: Int?
-            for index in cursor...(output.count - original.count)
-            where (0..<original.count).allSatisfy({ key(output[index + $0].text) == original[$0] }) {
-                found = index
-                break
+            guard !original.isEmpty, cursor <= output.count - original.count else { continue }
+            let found = (cursor...(output.count - original.count)).first { index in
+                (0..<original.count).allSatisfy { key(output[index + $0].text) == original[$0] }
             }
             guard let first = found else { continue }
             let run = output[first..<(first + original.count)]
@@ -336,7 +333,6 @@ actor ParakeetEngine: WindowedTranscriptionEngine, VocabularyConfigurable {
                 confidence: run.compactMap(\.confidence).min())
             output.replaceSubrange(first..<(first + original.count), with: [merged])
             cursor = first + 1
-            if cursor >= output.count { break }
         }
         return output
     }

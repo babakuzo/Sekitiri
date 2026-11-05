@@ -111,6 +111,12 @@ enum MeetingLibrary {
         guard let metaURL = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
             throw RenameError.noMetadata
         }
+        try setTitleOverride(title, in: metaURL)
+    }
+
+    /// Saves a typed title in meta.json, or clears it when blank so the
+    /// calendar or folder title shows again.
+    static func setTitleOverride(_ title: String, in metaURL: URL) throws {
         var meta = try JSONSerialization.jsonObject(with: Data(contentsOf: metaURL)) as? [String: Any] ?? [:]
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { meta.removeValue(forKey: "title_override") } else { meta["title_override"] = trimmed }
@@ -169,7 +175,7 @@ enum MeetingLibrary {
         let hasTranscript = [url, source].contains { directory in
             transcriptNames.contains { fm.fileExists(atPath: directory.appendingPathComponent($0).path) }
         }
-        let modern = fm.fileExists(atPath: source.appendingPathComponent("transcription-settings.json").path)
+        let modern = TranscriptIntegrity.isModernSession(source)
 
         let status: MeetingStatus
         let excerpt: String
@@ -258,13 +264,16 @@ enum MeetingLibrary {
     }
 
     private static func parseDate(from folder: String) -> Date? {
+        RecordingSession.folderFormat.date(from: String(folder.prefix(15)))
+            ?? dayFormat.date(from: String(folder.prefix(10)))
+    }
+
+    private static let dayFormat: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy.MM.dd-HHmm"
-        if let date = formatter.date(from: String(folder.prefix(15))) { return date }
         formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: String(folder.prefix(10)))
-    }
+        return formatter
+    }()
 }
 
 // MARK: - Screen
@@ -1255,9 +1264,9 @@ struct MeetingDetailView: View {
                     TranscriptSearchField(text: $transcriptQuery)
                         .frame(maxWidth: 320)
                     Spacer(minLength: 0)
-                    CopyTranscriptButton(text: transcript.plainText(names: speakerNames))
+                    CopyTranscriptButton { transcript.plainText(names: speakerNames) }
                 }
-                if transcript.segments.contains(where: \.hasLowConfidence) {
+                if transcript.hasLowConfidence {
                     Label("Words with a dotted underline were transcribed with low confidence.", systemImage: "info.circle")
                         .font(SekitiriType.caption)
                         .foregroundStyle(SekitiriColor.muted)
@@ -1332,7 +1341,7 @@ struct MeetingDetailView: View {
         moments = MarkedMoment.load(from: item.workingDirectory)
         summaryRaw = (try? String(contentsOf: item.url.appendingPathComponent("summary.md"), encoding: .utf8)) ?? ""
         let source = item.workingDirectory
-        let modern = fm.fileExists(atPath: source.appendingPathComponent("transcription-settings.json").path)
+        let modern = TranscriptIntegrity.isModernSession(source)
         let transcriptDirectory = modern ? source : item.url
         let diarized = transcriptDirectory.appendingPathComponent("transcript.diarized.md")
         let plain = transcriptDirectory.appendingPathComponent("transcript.md")

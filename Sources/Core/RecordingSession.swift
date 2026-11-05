@@ -100,7 +100,7 @@ final class RecordingSession: @unchecked Sendable {
         }
     }
 
-    private static let folderFormat: DateFormatter = {
+    static let folderFormat: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy.MM.dd-HHmm"
         f.locale = Locale(identifier: "en_US_POSIX")

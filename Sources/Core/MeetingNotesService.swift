@@ -200,22 +200,36 @@ enum MeetingNotesService {
         guard TranscriptIntegrity.isComplete(at: session) else {
             throw ServiceError.failed("Finish or retry transcription before deleting the source audio it still needs.")
         }
-        let fm = FileManager.default
-        var moves: [(original: URL, trashed: URL)] = []
-        for name in ["mic.caf", "system.caf", "segments"] {
-            let url = session.appendingPathComponent(name)
-            guard fm.fileExists(atPath: url.path) else { continue }
-            var trashed: NSURL?
-            try fm.trashItem(at: url, resultingItemURL: &trashed)
-            if let trashed = trashed as URL? { moves.append((url, trashed)) }
-        }
-        return TrashedAudio(moves: moves)
+        let audio = ["mic.caf", "system.caf", "segments"].map { session.appendingPathComponent($0) }
+        return TrashedAudio(moves: try moveToTrash(audio))
     }
 
     /// Moves trashed audio back into its session folder.
     static func restore(_ trashed: TrashedAudio) throws {
+        try putBack(trashed.moves)
+    }
+
+    /// Moves every existing item to the Trash, all or nothing: if one move
+    /// fails, the items already moved are put back before the error is thrown.
+    private static func moveToTrash(_ items: [URL]) throws -> [(original: URL, trashed: URL)] {
         let fm = FileManager.default
-        for move in trashed.moves where fm.fileExists(atPath: move.trashed.path) && !fm.fileExists(atPath: move.original.path) {
+        var moves: [(original: URL, trashed: URL)] = []
+        do {
+            for item in items where fm.fileExists(atPath: item.path) {
+                var trashed: NSURL?
+                try fm.trashItem(at: item, resultingItemURL: &trashed)
+                if let trashed = trashed as URL? { moves.append((item, trashed)) }
+            }
+        } catch {
+            try? putBack(moves)
+            throw error
+        }
+        return moves
+    }
+
+    private static func putBack(_ moves: [(original: URL, trashed: URL)]) throws {
+        let fm = FileManager.default
+        for move in moves where fm.fileExists(atPath: move.trashed.path) && !fm.fileExists(atPath: move.original.path) {
             try fm.moveItem(at: move.trashed, to: move.original)
         }
     }
@@ -226,39 +240,16 @@ enum MeetingNotesService {
         }
     }
 
-    /// Removes the capture folder and the matching meeting material in the
-    /// local vault. This is deliberately called only from a confirmed UI action.
-    static func deleteMeeting(for session: URL) throws {
-        let fm = FileManager.default
-        let source = session.standardizedFileURL.path
-        let config = try NativeNotesConfigStore.load()
-        var index = try NativeMeetingStore.loadIndex(config)
-        let matches = index.meetings.filter {
-            $0.sourceSessionDir.map { URL(fileURLWithPath: $0).standardizedFileURL.path == source } ?? false
-        }
-        for meeting in matches {
-            let folder = NativeMeetingStore.meetingFolder(config, id: meeting.id)
-            if fm.fileExists(atPath: folder.path) { try fm.removeItem(at: folder) }
-        }
-        if !matches.isEmpty {
-            index.meetings.removeAll {
-                $0.sourceSessionDir.map { URL(fileURLWithPath: $0).standardizedFileURL.path == source } ?? false
-            }
-            try NativeMeetingStore.saveIndex(config, index)
-        }
-        if fm.fileExists(atPath: session.path) { try fm.removeItem(at: session) }
-    }
-
     /// What `trashMeeting` moved, so the delete can be undone.
     struct TrashedMeeting: Sendable {
         fileprivate let moves: [(original: URL, trashed: URL)]
         fileprivate let removedEntries: Data
     }
 
-    /// Like `deleteMeeting`, but moves the folders to the Trash and keeps
-    /// enough to put everything back with `restore`.
+    /// Moves the capture folder and the matching meeting material in the
+    /// notes vault to the Trash, keeping enough to put everything back with
+    /// `restore`. Called only from a confirmed UI action.
     static func trashMeeting(for session: URL) throws -> TrashedMeeting {
-        let fm = FileManager.default
         let source = session.standardizedFileURL.path
         let config = try NativeNotesConfigStore.load()
         var index = try NativeMeetingStore.loadIndex(config)
@@ -266,27 +257,24 @@ enum MeetingNotesService {
             $0.sourceSessionDir.map { URL(fileURLWithPath: $0).standardizedFileURL.path == source } ?? false
         }
         let matches = index.meetings.filter(isMatch)
-        var folders = matches.map { NativeMeetingStore.meetingFolder(config, id: $0.id) }
-        folders.append(session)
-        var moves: [(original: URL, trashed: URL)] = []
-        for folder in folders where fm.fileExists(atPath: folder.path) {
-            var trashed: NSURL?
-            try fm.trashItem(at: folder, resultingItemURL: &trashed)
-            if let trashed = trashed as URL? { moves.append((folder, trashed)) }
-        }
+        let removedEntries = try JSONEncoder().encode(matches)
+        let folders = matches.map { NativeMeetingStore.meetingFolder(config, id: $0.id) } + [session]
+        let moves = try moveToTrash(folders)
         if !matches.isEmpty {
             index.meetings.removeAll(where: isMatch)
-            try NativeMeetingStore.saveIndex(config, index)
+            do {
+                try NativeMeetingStore.saveIndex(config, index)
+            } catch {
+                try? putBack(moves)
+                throw error
+            }
         }
-        return TrashedMeeting(moves: moves, removedEntries: try JSONEncoder().encode(matches))
+        return TrashedMeeting(moves: moves, removedEntries: removedEntries)
     }
 
     /// Moves trashed folders back and re-adds their index entries.
     static func restore(_ trashed: TrashedMeeting) throws {
-        let fm = FileManager.default
-        for move in trashed.moves where fm.fileExists(atPath: move.trashed.path) && !fm.fileExists(atPath: move.original.path) {
-            try fm.moveItem(at: move.trashed, to: move.original)
-        }
+        try putBack(trashed.moves)
         let entries = try JSONDecoder().decode([NativeMeeting].self, from: trashed.removedEntries)
         guard !entries.isEmpty else { return }
         let config = try NativeNotesConfigStore.load()

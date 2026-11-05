@@ -15,6 +15,7 @@ struct RecordView: View {
     /// Opens a meeting by id (session folder name) in the Meetings section.
     let openMeeting: (String) -> Void
     @State private var micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
+    @State private var readiness = RecordingReadiness.unknown
     @State private var completedTranscript: TranscriptDocument?
     @State private var completedNames = SpeakerNames()
 
@@ -48,16 +49,18 @@ struct RecordView: View {
                 SKRailLayout {
                     SetUpRecordingPage(micAuthorization: micAuthorization)
                 } rail: {
-                    TodaySchedulePanel(readiness: RecordingReadiness.current(), setUpRecording: {}, inline: false, showsFooter: false)
+                    TodaySchedulePanel(readiness: readiness, setUpRecording: {}, inline: false, showsFooter: false)
                 }
             }
         }
         .onAppear {
             micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
+            readiness = RecordingReadiness.current()
             model.retryAdditionalNotesSave()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             micAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
+            readiness = RecordingReadiness.current()
         }
         .task(id: completedTranscriptKey) { loadCompletedTranscript() }
     }
@@ -128,7 +131,7 @@ struct RecordView: View {
                 }
                 Spacer(minLength: 0)
                 if let completedTranscript, !completedTranscript.isEmpty {
-                    CopyTranscriptButton(text: completedTranscript.plainText(names: completedNames))
+                    CopyTranscriptButton { completedTranscript.plainText(names: completedNames) }
                         .padding(.bottom, 6)
                 }
             }
@@ -907,13 +910,15 @@ private struct LiveTranscriptScroll: View {
 }
 
 struct CopyTranscriptButton: View {
-    let text: String
+    /// Built only when clicked: the views holding this button re-render on
+    /// every playback tick, and a long transcript is costly to join.
+    let text: () -> String
     @State private var copied = false
 
     var body: some View {
         Button {
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
+            NSPasteboard.general.setString(text(), forType: .string)
             copied = true
         } label: {
             Label(copied ? "Copied" : "Copy Transcript", systemImage: copied ? "checkmark" : "doc.on.doc")

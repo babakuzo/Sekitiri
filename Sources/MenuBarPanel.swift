@@ -28,7 +28,7 @@ struct MenuBarPanel: View {
     @EnvironmentObject var model: AppModel
     @AppStorage(MiniRecorderController.enabledKey) private var miniRecorder = true
     @State private var recent: [MeetingItem] = []
-    @State private var readiness = RecordingReadiness.current()
+    @State private var readiness = RecordingReadiness.unknown
 
     private var capturing: Bool { model.recording || model.isStartingRecording }
 

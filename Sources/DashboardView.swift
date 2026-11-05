@@ -12,7 +12,7 @@ struct DashboardView: View {
     let openMeeting: (String) -> Void
     @State private var recent: [MeetingItem] = []
     @State private var inbox = OpenActionItem.Inbox()
-    @State private var readiness = RecordingReadiness.current()
+    @State private var readiness = RecordingReadiness.unknown
 
     private var firstName: String {
         let name = NSFullUserName().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -40,6 +40,7 @@ struct DashboardView: View {
             recent = Array(all.prefix(3))
             inbox = await OpenActionItem.load(from: all)
         }
+        .onAppear { readiness = RecordingReadiness.current() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             readiness = RecordingReadiness.current()
         }
@@ -107,6 +108,11 @@ struct RecordingReadiness: Equatable {
     var microphoneAllowed: Bool
     var microphoneUndetermined: Bool
     var systemAudio: Bool
+
+    /// Placeholder until `current()` runs on appear; @State initial values
+    /// are re-evaluated every time the view struct is rebuilt.
+    static let unknown = RecordingReadiness(microphoneName: nil, microphoneAllowed: true,
+                                            microphoneUndetermined: false, systemAudio: true)
 
     static func current() -> RecordingReadiness {
         let devices = AudioInputDevice.available()

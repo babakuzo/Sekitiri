@@ -39,6 +39,7 @@ struct TranscriptDocument: Equatable, Sendable {
     static let empty = TranscriptDocument(segments: [], notices: [], format: .plain, directory: nil)
 
     var isEmpty: Bool { segments.isEmpty }
+    var hasLowConfidence: Bool { segments.contains(where: \.hasLowConfidence) }
 
     /// Plain text for the clipboard or export, using display names.
     func plainText(names: SpeakerNames) -> String {
@@ -66,6 +67,7 @@ struct TranscriptDocument: Equatable, Sendable {
     }
 
     static func clock(_ seconds: TimeInterval) -> String {
+        guard seconds.isFinite else { return "0:00" }
         let total = max(0, Int(seconds))
         let h = total / 3600, m = (total % 3600) / 60, s = total % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
@@ -86,9 +88,7 @@ extension TranscriptDocument {
     static func load(session: URL?, vaultFolder: URL?) -> TranscriptDocument? {
         let fm = FileManager.default
         let existingSession = session.flatMap { fm.fileExists(atPath: $0.path) ? $0 : nil }
-        let modern = existingSession.map {
-            fm.fileExists(atPath: $0.appendingPathComponent("transcription-settings.json").path)
-        } ?? false
+        let modern = existingSession.map(TranscriptIntegrity.isModernSession) ?? false
         var directories: [URL] = modern
             ? [existingSession, vaultFolder].compactMap { $0 }
             : [vaultFolder, existingSession].compactMap { $0 }
