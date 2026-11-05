@@ -44,6 +44,9 @@ final class RecordingSession: @unchecked Sendable {
     /// queue. Lets the UI warn when the mic itself has gone silent while
     /// other participants are still audible through system audio.
     var onMicActivityChange: ((Bool) -> Void)?
+    /// Whether the microphone is delivering any signal at all, about once a
+    /// second on the main queue.
+    var onMicSignal: ((Bool) -> Void)?
     let dir: URL
     let startedAt = Date()
 
@@ -133,6 +136,9 @@ final class RecordingSession: @unchecked Sendable {
         }
         system.onAudioActivity = { [weak self] active in
             self?.publishAudioActivity(active)
+        }
+        mic.onSignal = { [weak self] hasSignal in
+            self?.onMicSignal?(hasSignal)
         }
     }
 

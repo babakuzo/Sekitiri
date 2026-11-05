@@ -80,6 +80,9 @@ final class AppModel: ObservableObject {
     /// The microphone alone has been silent for two minutes while other
     /// participants were still audible: likely the wrong or a muted input.
     @Published private(set) var micSilenceWarning = false
+    /// The microphone is delivering exact digital silence, which a working
+    /// mic never does: macOS is blocking it or it is muted.
+    @Published private(set) var micSendingNothing = false
     /// When the stop-after-silence safety will stop the recording.
     @Published private(set) var silenceStopDeadline: Date?
     /// Post-recording processing: stage from coordinator status events,
@@ -120,6 +123,9 @@ final class AppModel: ObservableObject {
     private var lastAudioActivityAt: Date?
     private var lastMicActivityAt: Date?
     static let micSilenceWarningSeconds: TimeInterval = 120
+    private var lastMicSignalAt: Date?
+    private var micSendingNothingNotified = false
+    nonisolated static let micNoSignalWarningSeconds: TimeInterval = 30
     private var hasAudioActivity = false
     private var remindedMeetingIDs = Set<String>()
     private var promptedCallIDs = Set<String>()
@@ -326,10 +332,13 @@ final class AppModel: ObservableObject {
         recordingSafetyPrompt = nil
         lastAudioActivityAt = Date()
         lastMicActivityAt = Date()
+        lastMicSignalAt = Date()
+        micSendingNothingNotified = false
         hasAudioActivity = false
         isHearingAudio = false
         noSoundWarning = false
         micSilenceWarning = false
+        micSendingNothing = false
         silenceStopDeadline = nil
         isStartingRecording = false
         isPaused = false
@@ -356,6 +365,11 @@ final class AppModel: ObservableObject {
                 self.lastMicActivityAt = Date()
                 if self.micSilenceWarning { self.micSilenceWarning = false }
             }
+        }
+        newSession.onMicSignal = { [weak self] hasSignal in
+            guard let self, hasSignal, self.recording, !self.isPaused else { return }
+            self.lastMicSignalAt = Date()
+            if self.micSendingNothing { self.micSendingNothing = false }
         }
         startLiveTranscription(for: newSession)
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
@@ -660,6 +674,7 @@ final class AppModel: ObservableObject {
                 isPaused = false
                 // Paused time is never counted as silence.
                 lastAudioActivityAt = Date()
+                lastMicSignalAt = Date()
                 setStatus("Recording", tone: .recording)
                 if !liveTranscriptionSuspendedForResources {
                     startLiveTranscription(for: session)
@@ -828,10 +843,12 @@ final class AppModel: ObservableObject {
     private func resetCaptureIndicators() {
         lastAudioActivityAt = nil
         lastMicActivityAt = nil
+        lastMicSignalAt = nil
         hasAudioActivity = false
         isHearingAudio = false
         noSoundWarning = false
         micSilenceWarning = false
+        micSendingNothing = false
         silenceStopDeadline = nil
         microphoneTrack = .off
         systemAudioTrack = .off
@@ -978,6 +995,12 @@ final class AppModel: ObservableObject {
         evaluateRecordingSafety(now: Date())
     }
 
+    /// Exact digital silence for this long means the mic is blocked or muted,
+    /// not just quiet.
+    nonisolated static func micIsSendingNothing(since lastSignal: Date, now: Date) -> Bool {
+        now.timeIntervalSince(lastSignal) >= micNoSignalWarningSeconds
+    }
+
     /// Stop-after-silence: warns after 30 s without sound, warns again one
     /// minute before the configured silence limit, then stops and saves.
     private func evaluateSilence(now: Date) {
@@ -989,6 +1012,14 @@ final class AppModel: ObservableObject {
         let micSilence = now.timeIntervalSince(lastMicActivityAt ?? session.startedAt)
         let micQuiet = !quiet && micSilence >= Self.micSilenceWarningSeconds
         if micSilenceWarning != micQuiet { micSilenceWarning = micQuiet }
+        let noSignal = Self.micIsSendingNothing(since: lastMicSignalAt ?? session.startedAt, now: now)
+        if micSendingNothing != noSignal { micSendingNothing = noSignal }
+        if noSignal, !micSendingNothingNotified {
+            // Once per recording: the meeting app is usually in front.
+            micSendingNothingNotified = true
+            notifyUser(title: "Sekitiri — your microphone isn’t recording",
+                       body: "It has sent no sound at all for 30 seconds. Check that Sekitiri is allowed to use the microphone and that it isn’t muted.")
+        }
 
         let minutes = UserDefaults.standard.integer(forKey: "recordingSafetyTimeoutMinutes")
         guard minutes > 0 else {

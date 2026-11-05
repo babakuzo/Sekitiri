@@ -39,6 +39,20 @@ struct CaptureReliabilityTests {
         #expect(!SystemAudioRecorder.isInterruption(recording: true, listening: device, current: AudioObjectID(43), alive: false))
     }
 
+    @Test("A mic sending exact zeros is told apart from a quiet one")
+    func micDigitalSilence() {
+        var zeros = [Float](repeating: 0, count: 4096)
+        #expect(zeros.withUnsafeBufferPointer { MicRecorder.peak(of: $0.baseAddress!, count: $0.count) } == 0)
+        // A quiet room is far below the activity threshold but never exactly zero
+        zeros[2000] = -0.0002
+        let quiet = zeros.withUnsafeBufferPointer { MicRecorder.peak(of: $0.baseAddress!, count: $0.count) }
+        #expect(quiet > 0 && quiet < 0.008)
+
+        let start = Date()
+        #expect(!AppModel.micIsSendingNothing(since: start, now: start.addingTimeInterval(29)))
+        #expect(AppModel.micIsSendingNothing(since: start, now: start.addingTimeInterval(30)))
+    }
+
     @Test("Only closed files are exposed and stop retains the final partial segment")
     func closedSnapshotsAndAssembly() throws {
         let directory = try temporaryDirectory()

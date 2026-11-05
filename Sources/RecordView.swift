@@ -480,6 +480,17 @@ private struct CaptureBanners: View {
                         .buttonStyle(.sk(.outline, .small))
                 }
             }
+            if model.micSendingNothing, model.recording, !model.isPaused {
+                SekitiriBanner(
+                    systemImage: "mic.slash",
+                    title: "Your microphone is sending no sound at all",
+                    message: "Nothing you say is being recorded. Check that Sekitiri is allowed to use the microphone and that the mic isn’t muted, or pick another microphone in the control bar.",
+                    severity: .danger
+                ) {
+                    Button("Open Privacy Settings") { SystemSettingsLink.open(SystemSettingsLink.microphone) }
+                        .buttonStyle(.sk(.outline, .small))
+                }
+            }
             if let deadline = model.silenceStopDeadline {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     let seconds = max(0, Int(deadline.timeIntervalSince(context.date).rounded(.up)))
@@ -498,7 +509,7 @@ private struct CaptureBanners: View {
                     title: "No sound detected for 30 seconds",
                     message: "Check that your microphone is connected, unmuted and selected in System Settings."
                 )
-            } else if model.micSilenceWarning, model.recording {
+            } else if model.micSilenceWarning, model.recording, !model.micSendingNothing {
                 SekitiriBanner(
                     systemImage: "mic.slash",
                     title: "Your microphone hasn’t picked up sound for 2 minutes",

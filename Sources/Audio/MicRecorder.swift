@@ -28,6 +28,10 @@ final class MicRecorder: @unchecked Sendable {
     /// Low-bandwidth activity signal used by the meeting auto-end policy.
     /// It carries only a boolean and never exposes audio samples.
     var onAudioActivity: ((Bool) -> Void)?
+    /// Whether the mic delivered any signal at all, reported with activity.
+    /// A working microphone always has some noise floor; exact zeros mean
+    /// macOS is withholding the input (permission) or it is muted.
+    var onSignal: ((Bool) -> Void)?
     enum RecorderError: Error, CustomStringConvertible {
         case engineStartFailed(Error)
         case fileCreationFailed(Error)
@@ -350,15 +354,21 @@ final class MicRecorder: @unchecked Sendable {
         guard buffer.frameLength > 0,
               let channel = buffer.floatChannelData?[0]
         else { return }
-        var peak: Float = 0
-        for index in 0..<Int(buffer.frameLength) {
-            peak = max(peak, abs(channel[index]))
-        }
+        let peak = Self.peak(of: channel, count: Int(buffer.frameLength))
         lastActivityReportAt = now
         let active = peak >= 0.008
         DispatchQueue.main.async { [weak self] in
             self?.onAudioActivity?(active)
+            self?.onSignal?(peak > 0)
         }
+    }
+
+    static func peak(of samples: UnsafePointer<Float>, count: Int) -> Float {
+        var peak: Float = 0
+        for index in 0..<count {
+            peak = max(peak, abs(samples[index]))
+        }
+        return peak
     }
 
     /// The voice-processing route delivered a full second of digital silence:
