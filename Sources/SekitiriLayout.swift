@@ -85,7 +85,15 @@ struct SKScroll<Content: View>: View {
 
     var body: some View {
         if DevSnapshot.isActive {
-            content.frame(maxHeight: .infinity, alignment: .top)
+            // Takes exactly the space offered, so a long page can't push
+            // the sidebar out of place; the overflow is clipped.
+            GeometryReader { proxy in
+                content
+                    .frame(width: proxy.size.width)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                    .clipped()
+            }
         } else {
             ScrollView { content }
         }

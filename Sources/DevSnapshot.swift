@@ -20,8 +20,9 @@ extension Notification.Name {
 
 @MainActor
 enum DevSnapshot {
-    /// `cacheDisplay` can't draw scroll-view content, so snapshot runs lay
-    /// pages out without scrolling. Read once at launch.
+    /// Neither `cacheDisplay` nor layer rendering can draw scroll-view
+    /// content, so snapshot runs lay pages out without scrolling, clipped to
+    /// the window. Read once at launch.
     nonisolated static let isActive = ProcessInfo.processInfo.environment["SEKITIRI_SNAPSHOT_DIR"] != nil
 
     static func runIfRequested(model: AppModel) {
@@ -97,9 +98,24 @@ enum DevSnapshot {
         window.orderOut(nil)
     }
 
+    /// Renders the layer tree, which includes scroll-view content that
+    /// `cacheDisplay` leaves blank.
     private static func capture(_ view: NSView, to url: URL) {
-        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        try? rep.representation(using: .png, properties: [:])?.write(to: url)
+        view.layoutSubtreeIfNeeded()
+        guard let layer = view.layer else { return }
+        let scale = view.window?.backingScaleFactor ?? 2
+        let width = Int(view.bounds.width * scale), height = Int(view.bounds.height * scale)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        else { return }
+        if layer.isGeometryFlipped || view.isFlipped {
+            context.translateBy(x: 0, y: CGFloat(height))
+            context.scaleBy(x: 1, y: -1)
+        }
+        context.scaleBy(x: scale, y: scale)
+        layer.render(in: context)
+        guard let image = context.makeImage() else { return }
+        try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: url)
     }
 }
