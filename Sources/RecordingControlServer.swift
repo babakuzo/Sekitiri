@@ -43,6 +43,10 @@ final class RecordingControlServer: @unchecked Sendable {
     }
 
     private func route(_ req: String, on conn: NWConnection) {
+        guard Self.isLocalTool(req) else {
+            send(conn, status: 403, body: "{\"error\":\"forbidden\"}")
+            return
+        }
         let body: String
         if req.hasPrefix("POST /stop") {
             handler("stop")
@@ -55,6 +59,23 @@ final class RecordingControlServer: @unchecked Sendable {
             return
         }
         send(conn, status: 200, body: body)
+    }
+
+    /// Only command-line tools on this Mac may use the server. Browsers add an
+    /// Origin header to cross-site requests, so any web page could otherwise
+    /// stop a recording; a Host other than loopback means DNS rebinding.
+    static func isLocalTool(_ request: String) -> Bool {
+        var host: String?
+        for line in request.split(separator: "\r\n").dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            if name == "origin" { return false }
+            if name == "host" { host = value.lowercased() }
+        }
+        guard let host else { return true }
+        let name = host.split(separator: ":").first.map(String.init) ?? host
+        return name == "127.0.0.1" || name == "localhost"
     }
 
     private func send(_ conn: NWConnection, status: Int, body: String) {

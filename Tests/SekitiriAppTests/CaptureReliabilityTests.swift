@@ -39,6 +39,16 @@ struct CaptureReliabilityTests {
         #expect(!SystemAudioRecorder.isInterruption(recording: true, listening: device, current: AudioObjectID(43), alive: false))
     }
 
+    @Test("Only local command-line tools can use the control server")
+    func controlServerRejectsBrowsers() {
+        #expect(RecordingControlServer.isLocalTool("POST /stop HTTP/1.1\r\nHost: 127.0.0.1:8393\r\nUser-Agent: curl/8.7.1\r\n\r\n"))
+        #expect(RecordingControlServer.isLocalTool("GET /status HTTP/1.1\r\nHost: localhost:8393\r\n\r\n"))
+        // Any web page can send this; browsers always attach Origin.
+        #expect(!RecordingControlServer.isLocalTool("POST /stop HTTP/1.1\r\nHost: 127.0.0.1:8393\r\nOrigin: https://example.com\r\n\r\n"))
+        // DNS rebinding: an attacker's name resolving to loopback.
+        #expect(!RecordingControlServer.isLocalTool("POST /stop HTTP/1.1\r\nHost: evil.example:8393\r\n\r\n"))
+    }
+
     @Test("A mic sending exact zeros is told apart from a quiet one")
     func micDigitalSilence() {
         var zeros = [Float](repeating: 0, count: 4096)
