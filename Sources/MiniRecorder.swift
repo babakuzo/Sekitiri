@@ -117,7 +117,11 @@ final class MiniRecorderController {
     private func resize(to size: CGSize) {
         guard size.width > 0, size.height > 0, size != contentSize else { return }
         contentSize = size
-        guard let panel, NSEvent.pressedMouseButtons == 0 else { return }
+        guard let panel else { return }
+        // The content often changes size under a click (Record, Stop). Don't
+        // drop that resize, or the panel stays too narrow and clips the pill;
+        // apply it once the button is released.
+        if NSEvent.pressedMouseButtons != 0 { scheduleSnap(); return }
         place(panel, animated: false)
     }
 
@@ -213,31 +217,42 @@ struct MiniRecorderPill: View {
                 Text(model.isStartingRecording ? "Starting…" : model.elapsed)
                     .font(SekitiriType.sans(16).monospacedDigit())
                     .foregroundStyle(SekitiriColor.ink)
+                    .lineLimit(1)
+                    .fixedSize()
             }
             .buttonStyle(.plain)
             .help("Open Sekitiri")
             .accessibilityLabel(model.isPaused ? "Paused, \(model.elapsed). Open Sekitiri" : "Recording, \(model.elapsed). Open Sekitiri")
-            ActivityWaveform(isActive: model.isHearingAudio && model.recording && !model.isPaused)
-                .scaleEffect(0.8)
-                .frame(width: 26)
+            if model.micSendingNothing, model.recording, !model.isPaused {
+                Button { MainWindow.show() } label: {
+                    Image(systemName: "mic.slash.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(SekitiriColor.warning)
+                        .frame(width: 26)
+                }
+                .buttonStyle(.plain)
+                .help("Your microphone is sending no sound. Open Sekitiri")
+                .accessibilityLabel("Microphone is sending no sound. Open Sekitiri")
+            } else {
+                ActivityWaveform(isActive: model.isHearingAudio && model.recording && !model.isPaused)
+                    .scaleEffect(0.8)
+                    .frame(width: 26)
+            }
             circleButton("flag", help: "Mark this moment (⇧⌘M)", disabled: !model.recording || model.isPaused) { model.markMoment() }
             circleButton(model.isPaused ? "play.fill" : "pause.fill",
                          help: model.isPaused ? "Resume (⇧⌘P)" : "Pause (⇧⌘P)",
                          disabled: !model.recording || model.isFinalizingRecording) { model.togglePause() }
             Button { model.stop() } label: {
-                HStack(spacing: 7) {
-                    RoundedRectangle(cornerRadius: 2).fill(SekitiriColor.onAccent).frame(width: 9, height: 9)
-                    Text(model.isStartingRecording ? "Cancel" : "Stop")
-                }
-                .font(SekitiriType.sans(14, .semibold))
-                .foregroundStyle(SekitiriColor.onAccent)
-                .padding(.horizontal, 14)
-                .frame(height: 36)
-                .background(SekitiriColor.terracotta, in: Capsule())
+                RoundedRectangle(cornerRadius: 2.5)
+                    .fill(SekitiriColor.onAccent)
+                    .frame(width: 12, height: 12)
+                    .frame(width: 36, height: 36)
+                    .background(SekitiriColor.terracotta, in: Circle())
             }
             .buttonStyle(SekitiriHoverButtonStyle())
             .disabled(model.isFinalizingRecording)
-            .help("Stop and save (⇧⌘R)")
+            .help(model.isStartingRecording ? "Cancel recording" : "Stop and save (⇧⌘R)")
+            .accessibilityLabel(model.isStartingRecording ? "Cancel recording" : "Stop and save")
         }
         .padding(.leading, 12)
         .padding(.trailing, 8)
