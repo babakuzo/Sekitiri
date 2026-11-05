@@ -303,14 +303,24 @@ final class SystemAudioRecorder: @unchecked Sendable {
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
+        let device = aggregateID
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
-            if !self.isAggregateAlive() {
+            if Self.isInterruption(recording: self.isRecording, listening: device,
+                                   current: self.aggregateID, alive: self.isAggregateAlive()) {
                 self.report(.unavailable(message: "System audio connection was interrupted. Your microphone recording has been preserved."))
             }
         }
         let status = AudioObjectAddPropertyListenerBlock(aggregateID, &address, DispatchQueue.main, listener)
         if status == noErr { aggregateAliveListener = listener }
+    }
+
+    /// Stop destroys the aggregate device, and a callback already queued on
+    /// main can still run afterwards, when the device reads as gone. Only the
+    /// device that is still capturing going away counts as an interruption;
+    /// otherwise every recording would end flagged and its notes blocked.
+    static func isInterruption(recording: Bool, listening: AudioObjectID, current: AudioObjectID, alive: Bool) -> Bool {
+        recording && current != kAudioObjectUnknown && listening == current && !alive
     }
 
     private func removeAggregateMonitoring() {

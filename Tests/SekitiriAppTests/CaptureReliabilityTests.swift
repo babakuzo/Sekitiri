@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 import Testing
 @testable import SekitiriApp
@@ -21,6 +22,21 @@ struct CaptureReliabilityTests {
             sampleRate: format.sampleRate, segmentDuration: 100 / format.sampleRate
         )
         return (writer, format)
+    }
+
+    @Test("Tearing down system audio at stop is not reported as an interruption")
+    func systemAudioTeardownIsNotAnInterruption() {
+        let device = AudioObjectID(42)
+        let unknown = AudioObjectID(kAudioObjectUnknown)
+        // A live device dying mid-recording is a real interruption
+        #expect(SystemAudioRecorder.isInterruption(recording: true, listening: device, current: device, alive: false))
+        // A spurious callback while the device is fine is not
+        #expect(!SystemAudioRecorder.isInterruption(recording: true, listening: device, current: device, alive: true))
+        // Callbacks that land after stop has destroyed the device are not
+        #expect(!SystemAudioRecorder.isInterruption(recording: false, listening: device, current: unknown, alive: false))
+        #expect(!SystemAudioRecorder.isInterruption(recording: false, listening: device, current: device, alive: false))
+        // Nor is one from a previous device after the recorder has moved on
+        #expect(!SystemAudioRecorder.isInterruption(recording: true, listening: device, current: AudioObjectID(43), alive: false))
     }
 
     @Test("Only closed files are exposed and stop retains the final partial segment")
