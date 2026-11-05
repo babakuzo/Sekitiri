@@ -1,5 +1,20 @@
 # Sekitiri third-party notices
 
+## quill
+
+Sekitiri started from quill by Humanitas Labs, released under the MIT
+License. Parts of the audio capture and transcription code still derive from
+it, and its copyright notice is kept in `LICENSE`:
+https://github.com/humanitas-labs/quill
+
+## Fonts
+
+IBM Plex Sans (Copyright IBM Corp.) and Newsreader (Copyright The Newsreader
+Project Authors) are bundled under the SIL Open Font License 1.1. The full
+license texts ship next to the font files in `Sources/Assets/Fonts/`.
+
+## Models and SDKs
+
 Sekitiri can download and run local speech and summarisation models through the
 FluidAudio and MLX Swift SDKs. Model assets are separate from the SDKs and may
 carry separate terms.
@@ -13,30 +28,33 @@ https://github.com/FluidInference/FluidAudio/blob/main/LICENSE
 Sekitiri currently resolves FluidAudio from the revision recorded in
 `Package.resolved`.
 
-## Parakeet TDT 0.6B v2/v3
+## Parakeet speech recognition (TDT 0.6B v2/v3, Ultra, CTC 110M)
 
 The NVIDIA Parakeet model cards identify the model weights as CC BY 4.0.
-Sekitiri uses the FluidInference CoreML conversions when the user selects
-Parakeet v2 or v3. The applicable model attribution is:
+Sekitiri uses FluidInference's CoreML conversions: TDT 0.6B v2 or v3 or
+Parakeet Ultra for transcription, and the CTC 110M model for custom
+vocabulary. The applicable attribution is:
 
-Copyright NVIDIA Corporation. Model: NVIDIA Parakeet TDT 0.6B.
+Copyright NVIDIA Corporation. Models: NVIDIA Parakeet TDT 0.6B, Parakeet TDT-CTC 110M.
 Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
 Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+Source: https://huggingface.co/nvidia/parakeet-tdt_ctc-110m
 License: https://creativecommons.org/licenses/by/4.0/
 
-The CoreML conversion is an independently distributed artifact. Keep the
+Parakeet Ultra is a post-trained Parakeet v3 by moondream, also CC BY 4.0:
+https://huggingface.co/moondream/parakeet-ultra
+CoreML conversion: https://huggingface.co/FluidInference/parakeet-ultra-coreml
+
+The CoreML conversions are independently distributed artifacts. Keep the
 upstream attribution, license link, and an indication of conversion or other
 changes when redistributing model files.
 
-## Nemotron 3.5 multilingual streaming
+## Silero voice activity detection
 
-Sekitiri uses FluidAudio's Nemotron streaming adapter for live partial
-transcription. The model is distributed under OpenMDW-1.1. Retain the full
-OpenMDW-1.1 license and NVIDIA origin notices when redistributing model
-materials:
-
-https://openmdw.ai/license/1-1/
-https://huggingface.co/FluidInference/Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML
+Transcription windows are planned with Silero VAD, MIT License, via
+FluidInference's CoreML conversion:
+https://github.com/snakers4/silero-vad
+https://huggingface.co/FluidInference/silero-vad-coreml
 
 ## Sortformer speaker diarization
 
@@ -65,24 +83,14 @@ content for inference.
 - swift-huggingface: Apache-2.0 — https://github.com/huggingface/swift-huggingface
 - swift-transformers: Apache-2.0 — https://github.com/huggingface/swift-transformers
 
-## Qwen3 4B 4-bit
+## Qwen3.5 2B and 0.8B 4-bit
 
-Sekitiri may download the pre-quantized MLX conversion
-`mlx-community/Qwen3-4B-4bit` when the user selects Qwen3. The upstream Qwen3
-model is released under Apache-2.0; retain the model-card attribution and
-license link for the exact revision used:
+Sekitiri may download the pre-quantized MLX conversions
+`mlx-community/Qwen3.5-2B-4bit` or `mlx-community/Qwen3.5-0.8B-4bit` when
+the user selects a Qwen summary model. Qwen3.5 is released under Apache-2.0;
+retain the model-card attribution and license link for the exact revision:
 
-https://huggingface.co/Qwen/Qwen3-4B
-
-## Gemma 3n E2B 4-bit
-
-Sekitiri may download the pre-quantized MLX conversion
-`mlx-community/gemma-3n-E2B-it-lm-4bit` when the user selects Gemma. Gemma
-models are subject to Google’s Gemma Terms of Use and Responsible AI Toolkit
-terms; retain the model-card attribution and exact-revision terms:
-
-https://ai.google.dev/gemma/docs/core/model_card_3n
-https://ai.google.dev/gemma/terms
+https://huggingface.co/Qwen/Qwen3.5-2B-Base
 
 ## Important
 

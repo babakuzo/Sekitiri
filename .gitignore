@@ -8,3 +8,6 @@
 .env.*
 *.key
 *.pem
+
+# Screenshots of real meetings, never published
+Docs/ui-comparison/

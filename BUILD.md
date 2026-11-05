@@ -25,7 +25,7 @@ This file is for **any agent (or human) who needs to build or modify this app.**
 
 | Path | What it is |
 |---|---|
-| `~/Projects/quillnotes-app` | **App source root** (this repo). SwiftUI mac app; recording + transcription engine runs **in-process** (no separate quill daemon/icon). |
+| Repository root | **App source root**. SwiftUI mac app; recording + transcription engine runs **in-process** (no separate quill daemon/icon). |
 | `Tools/build_app.sh` | Portable release build/packaging script. Derives the checkout root, stages/signs/verifies the app, defaults to `.local-validation/Sekitiri.app`. |
 | `Sources/Audio/` | Microphone and system capture, segmented recording, playback. |
 | `Sources/Transcription/` | Bounded audio reads, Parakeet inference, durable checkpoints, transcript integrity, serial coordination. |
@@ -67,8 +67,7 @@ Tools/build_app.sh --skip-build
 the current source. Packaging uses a temporary sibling directory and replaces a
 previous staging output only after verification. It refuses an output under
 `/Applications` or `~/Applications`; installation remains a separate reviewed
-step. The old `~/bin/reassemble-quillnotes.sh` helper is no longer the canonical
-packager. Build time depends on dependency caches and hardware; allow the
+step. Build time depends on dependency caches and hardware; allow the
 command to finish rather than treating an output timeout as a compiler error.
 
 Package resources live under `Contents/Resources`, as required for strict
