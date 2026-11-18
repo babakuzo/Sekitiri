@@ -1,5 +1,10 @@
 #!/bin/bash
 # Build/package Sekitiri locally. This never installs or replaces an installed app.
+#
+# Signing: without SEKITIRI_SIGN_IDENTITY the app gets an ad-hoc signature that
+# only runs on this Mac. Set it to a "Developer ID Application: …" identity to
+# sign for distribution, with the hardened runtime, a secure timestamp and the
+# entitlements in BuildSupport/Sekitiri.entitlements (needed for notarization).
 set -euo pipefail
 
 SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -30,6 +35,8 @@ case "$APP_DEST" in
     /Applications/*|"$HOME/Applications/"*) fail "Choose a staging output; installation is a separate step." ;;
 esac
 
+SIGN_IDENTITY="${SEKITIRI_SIGN_IDENTITY:--}"
+ENTITLEMENTS="$PROJECT_ROOT/BuildSupport/Sekitiri.entitlements"
 METAL_LIBRARY="$PROJECT_ROOT/BuildSupport/default.metallib"
 [[ -f "$METAL_LIBRARY" ]] || fail "Missing BuildSupport/default.metallib. Build MLX's Cmlx Metal library first."
 [[ -f "$PROJECT_ROOT/Sources/Info.plist" ]] || fail "Missing Sources/Info.plist."
@@ -107,10 +114,19 @@ done
 # it or a previous staging output; a failed package leaves the old copy intact.
 # Metal libraries are executable code too. Sign their staged copies before
 # signing the enclosing executable/app; never modify the source shader file.
-/usr/bin/codesign --force --sign - "$STAGED_APP/Contents/Resources/default.metallib"
-/usr/bin/codesign --force --sign - "$STAGED_APP/Contents/MacOS/Resources/default.metallib"
-/usr/bin/codesign --force --sign - "$STAGED_APP/Contents/MacOS/Sekitiri"
-/usr/bin/codesign --force --deep --sign - "$STAGED_APP"
+# Nested code is signed inside out; the app's own signature then seals it.
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    SIGN=(/usr/bin/codesign --force --sign -)
+    APP_SIGN=("${SIGN[@]}")
+else
+    [[ -f "$ENTITLEMENTS" ]] || fail "Missing BuildSupport/Sekitiri.entitlements."
+    SIGN=(/usr/bin/codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY")
+    APP_SIGN=("${SIGN[@]}" --entitlements "$ENTITLEMENTS")
+fi
+"${SIGN[@]}" "$STAGED_APP/Contents/Resources/default.metallib"
+"${SIGN[@]}" "$STAGED_APP/Contents/MacOS/Resources/default.metallib"
+"${APP_SIGN[@]}" "$STAGED_APP/Contents/MacOS/Sekitiri"
+"${APP_SIGN[@]}" "$STAGED_APP"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 if [[ -e "$APP_DEST" ]]; then
     [[ -d "$APP_DEST" && ! -L "$APP_DEST" ]] || fail "Existing output is not an app directory."

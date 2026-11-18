@@ -11,3 +11,6 @@
 
 # Screenshots of real meetings, never published
 Docs/ui-comparison/
+
+# Release disk images
+dist/

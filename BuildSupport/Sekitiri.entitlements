@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Hardened-runtime exceptions for Developer ID builds. Each one matches a
+     usage description in Sources/Info.plist; macOS still asks the user. -->
+<dict>
+    <!-- Recording the microphone. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <!-- Meeting detection and titles from the calendar. -->
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
+    <!-- Reading the active Chrome or Safari tab's URL to recognise a call. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>
