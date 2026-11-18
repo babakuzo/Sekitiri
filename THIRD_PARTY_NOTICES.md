@@ -92,6 +92,30 @@ retain the model-card attribution and license link for the exact revision:
 
 https://huggingface.co/Qwen/Qwen3.5-2B-Base
 
+## Libraries built into the app
+
+The released app contains compiled code from these packages, at the versions
+pinned in `Package.resolved`. Their full license and NOTICE texts, including
+the code they vendor (MLX, mlx-c, metal-cpp, fmt and nlohmann/json inside
+mlx-swift), ship inside the app as `Contents/Resources/Acknowledgements.txt`.
+
+| Package | License |
+|---|---|
+| [EventSource](https://github.com/mattt/EventSource) | MIT |
+| [FluidAudio](https://github.com/FluidInference/FluidAudio) | Apache-2.0 |
+| [mlx-swift](https://github.com/ml-explore/mlx-swift) | MIT |
+| [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm) | MIT |
+| [swift-argument-parser](https://github.com/apple/swift-argument-parser) | Apache-2.0 |
+| [swift-asn1](https://github.com/apple/swift-asn1) | Apache-2.0 |
+| [swift-collections](https://github.com/apple/swift-collections) | Apache-2.0 |
+| [swift-crypto](https://github.com/apple/swift-crypto) | Apache-2.0 |
+| [swift-huggingface](https://github.com/huggingface/swift-huggingface) | Apache-2.0 |
+| [swift-jinja](https://github.com/huggingface/swift-jinja) | Apache-2.0 |
+| [swift-numerics](https://github.com/apple/swift-numerics) | Apache-2.0 |
+| [swift-syntax](https://github.com/swiftlang/swift-syntax) | Apache-2.0 |
+| [swift-transformers](https://github.com/huggingface/swift-transformers) | Apache-2.0 |
+| [yyjson](https://github.com/ibireme/yyjson) | MIT |
+
 ## Important
 
 This notice file is an engineering inventory, not legal advice. Model files

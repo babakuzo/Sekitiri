@@ -100,6 +100,31 @@ cp -R "$PROJECT_ROOT/Sources/Assets/." "$STAGED_APP/Contents/Resources/"
 cp "$METAL_LIBRARY" "$STAGED_APP/Contents/Resources/default.metallib"
 cp "$METAL_LIBRARY" "$STAGED_APP/Contents/MacOS/Resources/default.metallib"
 
+# The licenses of everything compiled into the app travel with it, as MIT and
+# Apache-2.0 require for binary copies: Sekitiri's own, the notices file, and
+# the LICENSE/NOTICE texts of every package pinned in Package.resolved,
+# including code those packages vendor.
+write_acknowledgements() {
+    local checkouts="$PROJECT_ROOT/.build/checkouts" location name directory file
+    echo "Sekitiri includes the open-source software listed below, under the licenses that follow each name."
+    while IFS= read -r location; do
+        name="$(basename -- "${location%.git}")"
+        directory="$checkouts/$name"
+        [[ -d "$directory" ]] || fail "No checkout of $name. Run swift build first."
+        printf '\n\n==== %s (%s) ====\n' "$name" "$location"
+        while IFS= read -r file; do
+            printf '\n---- %s ----\n\n' "${file#"$directory"/}"
+            cat -- "$file"
+        done < <(
+            find "$directory" -maxdepth 1 -type f \( -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \)
+            find "$directory"/Source/*/* -maxdepth 1 -type f -iname 'LICENSE*' 2>/dev/null
+            find "$directory/ThirdPartyLicenses" -type f 2>/dev/null
+        )
+    done < <(/usr/bin/python3 -c 'import json,sys; print("\n".join(sorted(p["location"] for p in json.load(open(sys.argv[1]))["pins"])))' "$PROJECT_ROOT/Package.resolved")
+}
+cp "$PROJECT_ROOT/LICENSE" "$PROJECT_ROOT/THIRD_PARTY_NOTICES.md" "$STAGED_APP/Contents/Resources/"
+write_acknowledgements > "$STAGED_APP/Contents/Resources/Acknowledgements.txt"
+
 # Standard macOS signing requires resources below Contents/Resources. Never
 # put package bundles or symlinks beside Contents: strict signing rejects that
 # layout as unsealed root content. Supported model snapshots include their own
