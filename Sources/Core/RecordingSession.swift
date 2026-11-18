@@ -107,13 +107,10 @@ final class RecordingSession: @unchecked Sendable {
         return f
     }()
 
-    /// Create the session folder under `root` (yyyy.MM.dd-HHmm, suffixed on
-    /// collision) without starting capture yet.
-    init(root: URL, captureSystemAudio: Bool = true, meeting: MeetingContext? = nil, titleOverride: String? = nil) throws {
-        self.captureSystemAudio = captureSystemAudio
-        self.meeting = meeting
-        self.titleOverride = titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? titleOverride : nil
-        let base = Self.folderFormat.string(from: startedAt)
+    /// Creates a new session folder named for `startedAt` (yyyy.MM.dd-HHmm),
+    /// suffixed -2, -3… when that minute already has one.
+    static func makeDirectory(in root: URL, startedAt: Date) throws -> URL {
+        let base = folderFormat.string(from: startedAt)
         var candidate = root.appendingPathComponent(base, isDirectory: true)
         var n = 2
         while FileManager.default.fileExists(atPath: candidate.path) {
@@ -121,7 +118,16 @@ final class RecordingSession: @unchecked Sendable {
             n += 1
         }
         try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
-        dir = candidate
+        return candidate
+    }
+
+    /// Create the session folder under `root` (yyyy.MM.dd-HHmm, suffixed on
+    /// collision) without starting capture yet.
+    init(root: URL, captureSystemAudio: Bool = true, meeting: MeetingContext? = nil, titleOverride: String? = nil) throws {
+        self.captureSystemAudio = captureSystemAudio
+        self.meeting = meeting
+        self.titleOverride = titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? titleOverride : nil
+        dir = try Self.makeDirectory(in: root, startedAt: startedAt)
         mic.onHealthChange = { [weak self] health in
             self?.microphoneHealth = health
             self?.publishHealth()

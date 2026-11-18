@@ -69,4 +69,49 @@ struct EngineSmokeTests {
         #expect(words.allSatisfy { $0.confidence != nil })
         #expect(windows.allSatisfy { $0.window.readEnd - $0.window.readStart < 15 })
     }
+
+    @Test("An imported compressed file is transcribed end to end by the real pipeline")
+    func importedFile() async throws {
+        let work = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = work.appendingPathComponent("Recordings")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: work) }
+        let sentences = [
+            "Welcome to the quarterly review of the support team.",
+            "Response times improved by twenty percent since August.",
+            "Daniel will draft the new escalation guide by Friday.",
+        ]
+        let audio = work.appendingPathComponent("Support review.m4a")
+        let say = Process()
+        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        say.arguments = ["-o", audio.path, "--file-format=m4af", "--data-format=aac",
+                         sentences.joined(separator: " [[slnc 900]] ")]
+        try say.run()
+        say.waitUntilExit()
+        #expect(say.terminationStatus == 0)
+
+        let session = try await AudioImport.importFile(audio, into: root)
+        let engineName = ProcessInfo.processInfo.environment["SEKITIRI_ENGINE"] ?? "parakeet-v3"
+        try Data(#"{"engine":"\#(engineName)","language":"auto"}"#.utf8)
+            .write(to: session.appendingPathComponent("transcription-settings.json"))
+        let coordinator = TranscriptionCoordinator(runHooks: false, transcriptionEnabled: { true },
+                                                   speakerEnrichmentEnabled: { false })
+        let (events, continuation) = AsyncStream<TranscriptionCoordinator.Status>.makeStream()
+        await coordinator.setStatusHandler { status in
+            continuation.yield(status)
+            if case .idle = status { continuation.finish() }
+        }
+        await coordinator.enqueue(session)
+        for await _ in events {}
+
+        #expect(TranscriptIntegrity.isComplete(at: session))
+        let transcript = try JSONDecoder().decode(
+            Transcript.self, from: Data(contentsOf: session.appendingPathComponent("transcript.json")))
+        let heard = Set(EchoSuppression.tokens(transcript.segments.map(\.text).joined(separator: " ")))
+        let expected = EchoSuppression.tokens(sentences.joined(separator: " "))
+        let recalled = expected.filter(heard.contains).count
+        print("import-smoke engine=\(engineName) segments=\(transcript.segments.count) recall=\(recalled)/\(expected.count)")
+        #expect(Double(recalled) / Double(expected.count) >= 0.9)
+        #expect(transcript.segments.allSatisfy { $0.speaker == "them" })
+    }
 }

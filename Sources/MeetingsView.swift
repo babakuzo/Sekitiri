@@ -323,6 +323,15 @@ struct MeetingsScreenView: View {
                 } rail: {
                     PeopleRail(items: items, selected: $person)
                 }
+                .dropDestination(for: URL.self) { urls, _ in
+                    let audio = urls.filter { url in
+                        (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType).map { type in
+                            AudioImport.contentTypes.contains { type.conforms(to: $0) }
+                        } ?? false
+                    }
+                    model.importAudio(from: audio)
+                    return !audio.isEmpty
+                }
             }
         }
         .task(id: model.archiveRevision) {
@@ -417,15 +426,23 @@ private struct MeetingArchiveView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("All Your Meetings")
-                    .font(SekitiriType.pageTitle)
-                    .accessibilityAddTraits(.isHeader)
-                if !allItems.isEmpty {
-                    Text(summaryLine)
-                        .font(SekitiriType.sans(17))
-                        .foregroundStyle(SekitiriColor.muted)
+            HStack(alignment: .firstTextBaseline, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("All Your Meetings")
+                        .font(SekitiriType.pageTitle)
+                        .accessibilityAddTraits(.isHeader)
+                    if !allItems.isEmpty {
+                        Text(summaryLine)
+                            .font(SekitiriType.sans(17))
+                            .foregroundStyle(SekitiriColor.muted)
+                    }
                 }
+                Spacer(minLength: 0)
+                Button { model.chooseAudioToImport() } label: {
+                    Label("Import Audio", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.sk(.outline, .small))
+                .help("Transcribe an existing recording (⇧⌘I). You can also drop audio files here.")
             }
 
             ViewThatFits(in: .horizontal) {
@@ -439,7 +456,7 @@ private struct MeetingArchiveView: View {
                         .font(SekitiriType.subTitle)
                     Text(isFiltering
                          ? "Try a different title, person or phrase from the notes, or clear the filters."
-                         : "Record a meeting to keep its transcript, notes, action items and your own notes together here.")
+                         : "Record a meeting, or import or drop in an existing recording, to keep its transcript, notes and action items together here.")
                         .font(SekitiriType.body)
                         .foregroundStyle(SekitiriColor.muted)
                         .fixedSize(horizontal: false, vertical: true)

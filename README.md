@@ -22,6 +22,9 @@ folders you choose, and the speech and summary models run on-device.
   transcript, and you can play the audio from there.
 - Warns you during a recording if the microphone or computer audio goes
   silent, so a muted mic doesn't cost you a meeting.
+- Imports existing recordings (audio or video files, from the Import Audio
+  button, File menu or by dropping them on the meetings list) and processes
+  them like any other meeting.
 - Lets you mark moments, add your own notes, and later delete the audio while
   keeping the transcript.
 
@@ -50,9 +53,17 @@ open .local-validation/Sekitiri.app
 signs it for this Mac. See [BUILD.md](BUILD.md) for the architecture, the
 folder layout and the packaging details.
 
-Release builds downloaded from elsewhere need a Developer ID signature and
-notarization to open without a Gatekeeper warning; builds you make yourself
-run on your own Mac.
+Builds you make yourself run on your own Mac. To make a disk image others can
+open without a Gatekeeper warning, sign and notarize it with a Developer ID:
+
+```bash
+SEKITIRI_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+SEKITIRI_NOTARY_PROFILE=<notarytool keychain profile> \
+Tools/make_dmg.sh
+```
+
+The script explains the one-time `notarytool store-credentials` step and
+writes `dist/Sekitiri-<version>.dmg`.
 
 ## Where your files live
 

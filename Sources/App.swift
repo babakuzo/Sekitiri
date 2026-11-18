@@ -650,6 +650,54 @@ final class AppModel: ObservableObject {
         Task { [coordinator] in await coordinator.enqueue(sessionDirectory) }
     }
 
+    /// Asks for audio or video files and imports them.
+    func chooseAudioToImport() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Audio"
+        panel.prompt = "Import"
+        panel.message = "Choose recordings to transcribe. The originals aren’t changed."
+        panel.allowedContentTypes = AudioImport.contentTypes
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK else { return }
+        importAudio(from: panel.urls)
+    }
+
+    /// Imports existing recordings as meetings, transcribes them like any
+    /// other, and opens the first one. Transcription waits while recording.
+    func importAudio(from urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        showToast(urls.count == 1 ? "Importing \(urls[0].lastPathComponent)…" : "Importing \(urls.count) files…")
+        Task {
+            var imported: [URL] = []
+            var failures: [String] = []
+            for url in urls {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    imported.append(try await AudioImport.importFile(url, into: Self.recordingsRoot()))
+                } catch {
+                    failures.append(error.localizedDescription)
+                }
+            }
+            for directory in imported {
+                await coordinator.enqueue(directory)
+            }
+            archiveRevision &+= 1
+            if let first = imported.first {
+                requestedMeetingID = first.lastPathComponent
+            }
+            if let failure = failures.first {
+                setStatus(failures.count == 1 ? failure : "\(failures.count) files couldn’t be imported. \(failure)", tone: .warning)
+            }
+            if !imported.isEmpty {
+                showToast(recording
+                    ? "Imported. Transcription starts when this recording ends."
+                    : imported.count == 1 ? "Imported. Transcribing now." : "Imported \(imported.count) files. Transcribing now.")
+            }
+        }
+    }
+
     func revealRecording(at directory: URL) {
         let files = ["mic.caf", "system.caf"].map { directory.appendingPathComponent($0) }
         let existing = files.filter { FileManager.default.fileExists(atPath: $0.path) }
@@ -1228,6 +1276,10 @@ struct RecordingCommands: Commands {
             Button("Mark Moment") { model.markMoment() }
                 .keyboardShortcut("m", modifiers: [.command, .shift])
                 .disabled(!model.recording || model.isPaused)
+        }
+        CommandGroup(after: .newItem) {
+            Button("Import Audio…") { model.chooseAudioToImport() }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
         }
     }
 }
