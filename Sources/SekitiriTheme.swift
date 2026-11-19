@@ -465,6 +465,7 @@ extension SekitiriBanner where Actions == EmptyView {
 enum SystemSettingsLink {
     static let microphone = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
     static let audioCapture = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")!
+    static let storage = URL(string: "x-apple.systempreferences:com.apple.settings.Storage")!
 
     static func open(_ url: URL) { NSWorkspace.shared.open(url) }
 }

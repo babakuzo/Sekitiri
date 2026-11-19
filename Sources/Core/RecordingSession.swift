@@ -47,6 +47,9 @@ final class RecordingSession: @unchecked Sendable {
     /// Whether the microphone is delivering any signal at all, about once a
     /// second on the main queue.
     var onMicSignal: ((Bool) -> Void)?
+    /// Computer-audio-only activity, on the main queue. Hearing it once
+    /// proves macOS lets Sekitiri record computer audio.
+    var onSystemActivityChange: ((Bool) -> Void)?
     let dir: URL
     let startedAt = Date()
 
@@ -141,6 +144,7 @@ final class RecordingSession: @unchecked Sendable {
             self?.publishAudioActivity(active)
         }
         system.onAudioActivity = { [weak self] active in
+            self?.onSystemActivityChange?(active)
             self?.publishAudioActivity(active)
         }
         mic.onSignal = { [weak self] hasSignal in

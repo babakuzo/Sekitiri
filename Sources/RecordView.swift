@@ -278,29 +278,37 @@ private struct SetUpRecordingPage: View {
     @EnvironmentObject var model: AppModel
     let micAuthorization: AVAuthorizationStatus
     @AppStorage("systemAudio") private var systemAudio = true
+    @State private var preflight: RecordingPreflight.Snapshot?
+
+    private var micBlocked: Bool { micAuthorization == .denied || micAuthorization == .restricted }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 32) {
-            if micAuthorization == .denied || micAuthorization == .restricted {
-                SekitiriBanner(
-                    systemImage: "mic.slash",
-                    title: "Sekitiri can’t use your microphone",
-                    message: "Allow Sekitiri in System Settings › Privacy & Security › Microphone, then come back.",
-                    severity: .danger
-                ) {
-                    Button("Open Privacy Settings") { SystemSettingsLink.open(SystemSettingsLink.microphone) }
-                        .buttonStyle(.sk(.outline, .small))
+            VStack(alignment: .leading, spacing: 12) {
+                if micBlocked {
+                    SekitiriBanner(
+                        systemImage: "mic.slash",
+                        title: "Sekitiri can’t use your microphone",
+                        message: "Allow Sekitiri in System Settings › Privacy & Security › Microphone, then come back.",
+                        severity: .danger
+                    ) {
+                        Button("Open Privacy Settings") { SystemSettingsLink.open(SystemSettingsLink.microphone) }
+                            .buttonStyle(.sk(.outline, .small))
+                    }
+                } else if let meeting = model.activeMeeting ?? model.upcomingMeeting,
+                          model.draftMeetingTitle != meeting.title {
+                    SekitiriBanner(
+                        systemImage: "calendar",
+                        title: meeting.title,
+                        message: "\(SKDate.relative(to: meeting.start, end: meeting.end)) on your calendar\(meeting.attendees.isEmpty ? "" : ", with \(meeting.attendees.count) \(meeting.attendees.count == 1 ? "attendee" : "attendees")").",
+                        severity: .info
+                    ) {
+                        Button("Use This Meeting") { model.draftMeetingTitle = meeting.title }
+                            .buttonStyle(.sk(.outline, .small))
+                    }
                 }
-            } else if let meeting = model.activeMeeting ?? model.upcomingMeeting,
-                      model.draftMeetingTitle != meeting.title {
-                SekitiriBanner(
-                    systemImage: "calendar",
-                    title: meeting.title,
-                    message: "\(SKDate.relative(to: meeting.start, end: meeting.end)) on your calendar\(meeting.attendees.isEmpty ? "" : ", with \(meeting.attendees.count) \(meeting.attendees.count == 1 ? "attendee" : "attendees")").",
-                    severity: .info
-                ) {
-                    Button("Use This Meeting") { model.draftMeetingTitle = meeting.title }
-                        .buttonStyle(.sk(.outline, .small))
+                if let preflight {
+                    PreflightBanners(snapshot: preflight, systemAudio: systemAudio) { refreshPreflight() }
                 }
             }
 
@@ -361,16 +369,88 @@ private struct SetUpRecordingPage: View {
                         }
                     }
                     .buttonStyle(.sk(.primary, .large))
-                    .disabled(model.isFinalizingRecording || micAuthorization == .denied || micAuthorization == .restricted)
-                    Text("Make sure everyone has agreed to be recorded.")
+                    .disabled(model.isFinalizingRecording || micBlocked)
+                    Text(micBlocked ? "Allow the microphone to start." : "Make sure everyone has agreed to be recorded.")
                         .font(SekitiriType.meta)
-                        .foregroundStyle(SekitiriColor.muted)
+                        .foregroundStyle(micBlocked ? SekitiriColor.dangerText : SekitiriColor.muted)
                 }
                 .padding(.top, 18)
             }
             .sekitiriCard(cornerRadius: 14, padding: 22)
 
-            ReadinessChecklist(micAuthorization: micAuthorization, systemAudio: systemAudio)
+            ReadinessChecklist(micAuthorization: micAuthorization, systemAudio: systemAudio,
+                               stopShortcutEverywhere: preflight?.stopShortcutEverywhere ?? true)
+        }
+        .task { refreshPreflight() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshPreflight()
+        }
+    }
+
+    private func refreshPreflight() {
+        Task { preflight = await RecordingPreflight.snapshot() }
+    }
+}
+
+/// Problems to fix before pressing Record. The microphone banner above
+/// blocks recording; these only warn, so a meeting is never held up.
+private struct PreflightBanners: View {
+    @EnvironmentObject var model: AppModel
+    let snapshot: RecordingPreflight.Snapshot
+    let systemAudio: Bool
+    let refresh: () -> Void
+    @State private var testing = false
+    @State private var testFailed = false
+
+    var body: some View {
+        if systemAudio, !snapshot.computerAudioConfirmed {
+            SekitiriBanner(
+                systemImage: "speaker.slash",
+                title: testFailed ? "Sekitiri didn’t hear the test sound" : "Check that Sekitiri can hear computer audio",
+                message: testFailed
+                    ? "Allow Sekitiri under Screen & System Audio Recording (macOS may have just asked), make sure the sound isn’t muted, then test again."
+                    : "macOS has to allow it first. Until then, only your side of a call is recorded. The test plays a short sound.",
+                severity: .warning
+            ) {
+                Button(testing ? "Testing…" : "Test Computer Audio", action: test)
+                    .buttonStyle(.sk(.outline, .small))
+                    .disabled(testing || model.recording || model.isStartingRecording)
+                if testFailed {
+                    Button("Open Privacy Settings") { SystemSettingsLink.open(SystemSettingsLink.audioCapture) }
+                        .buttonStyle(.sk(.outline, .small))
+                }
+            }
+        }
+        if !snapshot.speechModelReady, !snapshot.online {
+            SekitiriBanner(
+                systemImage: "wifi.slash",
+                title: "Speech model not downloaded, and you’re offline",
+                message: "You can still record. The transcript can only be made once you’re back online and the speech model, about 630 MB, has downloaded.",
+                severity: .info
+            ) { EmptyView() }
+        }
+        if let free = snapshot.freeBytes, free < RecordingPreflight.lowSpaceBeforeRecording {
+            let left = RecordingPreflight.recordingTimeLeft(freeBytes: free)
+            SekitiriBanner(
+                systemImage: "internaldrive",
+                title: "\(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) free, enough for \(RecordingPreflight.describe(left)) of recording",
+                message: "Transcripts need room too. Free up space before a long meeting.",
+                severity: left < 1800 ? .danger : .warning
+            ) {
+                Button("Free Up Space") { SystemSettingsLink.open(SystemSettingsLink.storage) }
+                    .buttonStyle(.sk(.outline, .small))
+            }
+        }
+    }
+
+    private func test() {
+        testing = true
+        Task {
+            let heard = await RecordingPreflight.testComputerAudio()
+            testing = false
+            testFailed = !heard
+            if heard { model.showToast("Computer audio works") }
+            refresh()
         }
     }
 }
@@ -378,6 +458,7 @@ private struct SetUpRecordingPage: View {
 private struct ReadinessChecklist: View {
     let micAuthorization: AVAuthorizationStatus
     let systemAudio: Bool
+    let stopShortcutEverywhere: Bool
     @State private var items: [(ok: Bool, text: String)] = []
 
     var body: some View {
@@ -389,6 +470,27 @@ private struct ReadinessChecklist: View {
                 } icon: {
                     Image(systemName: item.ok ? "checkmark.circle" : "exclamationmark.circle")
                         .foregroundStyle(item.ok ? SekitiriColor.sage : SekitiriColor.caution)
+                }
+            }
+            if !items.isEmpty {
+                Label {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(stopShortcutEverywhere
+                             ? "⌥⌘R stops a recording from any app"
+                             : "⌥⌘R stops a recording only while Sekitiri is in front")
+                            .font(SekitiriType.sans(15))
+                        if !stopShortcutEverywhere {
+                            Text("To use it from your call app, allow Sekitiri under Privacy & Security › Accessibility.")
+                                .font(SekitiriType.meta)
+                                .foregroundStyle(SekitiriColor.muted)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button("Allow") { RecordingPreflight.askForStopShortcutPermission() }
+                                .buttonStyle(.sk(.outline, .small))
+                        }
+                    }
+                } icon: {
+                    Image(systemName: stopShortcutEverywhere ? "checkmark.circle" : "exclamationmark.circle")
+                        .foregroundStyle(stopShortcutEverywhere ? SekitiriColor.sage : SekitiriColor.caution)
                 }
             }
         }
@@ -491,6 +593,17 @@ private struct CaptureBanners: View {
                     severity: .danger
                 ) {
                     Button("Open Privacy Settings") { SystemSettingsLink.open(SystemSettingsLink.microphone) }
+                        .buttonStyle(.sk(.outline, .small))
+                }
+            }
+            if let left = model.recordingSpaceLeft {
+                SekitiriBanner(
+                    systemImage: "internaldrive",
+                    title: "Disk space is running low",
+                    message: "This Mac has room for \(RecordingPreflight.describe(left)) more of recording. Everything so far is saved; free up space so the meeting keeps recording.",
+                    severity: left < 1800 ? .danger : .warning
+                ) {
+                    Button("Free Up Space") { SystemSettingsLink.open(SystemSettingsLink.storage) }
                         .buttonStyle(.sk(.outline, .small))
                 }
             }

@@ -86,6 +86,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var micSendingNothing = false
     /// When the stop-after-silence safety will stop the recording.
     @Published private(set) var silenceStopDeadline: Date?
+    /// Recording time the disk has room for, once it is running low.
+    @Published private(set) var recordingSpaceLeft: TimeInterval?
+    /// Unfinished recordings saved at launch, shown once in the main window.
+    @Published var recoveredRecordings: [RecoveredRecording] = []
     /// Post-recording processing: stage from coordinator status events,
     /// fraction and time estimate from its progress reports.
     @Published var transcriptionProgress: TranscriptionProgressInfo?
@@ -126,6 +130,8 @@ final class AppModel: ObservableObject {
     static let micSilenceWarningSeconds: TimeInterval = 120
     private var lastMicSignalAt: Date?
     private var micSendingNothingNotified = false
+    private var lastSpaceCheckAt: Date?
+    private var lowSpaceNotified = false
     nonisolated static let micNoSignalWarningSeconds: TimeInterval = 30
     private var remindedMeetingIDs = Set<String>()
     private var promptedCallIDs = Set<String>()
@@ -172,13 +178,8 @@ final class AppModel: ObservableObject {
         calendarService = CalendarService()
         calendarAuthorization = calendarService.authorizationStatus
         let root = AppModel.recordingsRoot()
-        let recovered = RecordingSession.recoverInterruptedSessions(in: root)
-        if !recovered.isEmpty {
-            notifyUser(
-                title: "Sekitiri — recording recovered",
-                body: "An interrupted recording was preserved on this Mac and queued for transcription."
-            )
-        }
+        recoveredRecordings = RecordingSession.recoverInterruptedSessions(in: root)
+            .map(RecoveredRecording.init(directory:))
         Task {
             await refreshLocalSummaryModelState()
             await coordinator.setStatusHandler { [weak self] status in
@@ -355,6 +356,13 @@ final class AppModel: ObservableObject {
                 guard let self, active, self.recording, !self.isPaused else { return }
                 self.lastMicActivityAt = Date()
                 if self.micSilenceWarning { self.micSilenceWarning = false }
+            }
+        }
+        newSession.onSystemActivityChange = { active in
+            Task { @MainActor in
+                if active, !RecordingPreflight.computerAudioConfirmed {
+                    RecordingPreflight.setComputerAudioConfirmed(true)
+                }
             }
         }
         newSession.onMicSignal = { [weak self] hasSignal in
@@ -893,6 +901,9 @@ final class AppModel: ObservableObject {
         micSilenceWarning = false
         micSendingNothing = false
         silenceStopDeadline = nil
+        recordingSpaceLeft = nil
+        lastSpaceCheckAt = nil
+        lowSpaceNotified = false
         microphoneTrack = .off
         systemAudioTrack = .off
     }
@@ -935,6 +946,35 @@ final class AppModel: ObservableObject {
         }
         evaluateSilence(now: now)
         evaluateRecordingSafety(now: now)
+        evaluateDiskSpace(now: now)
+    }
+
+    /// Checks free space every 30 seconds while recording and warns, once by
+    /// notification, when it drops below about eight hours of recording.
+    private func evaluateDiskSpace(now: Date) {
+        guard recording else { return }
+        if let last = lastSpaceCheckAt, now.timeIntervalSince(last) < 30 { return }
+        lastSpaceCheckAt = now
+        guard let free = RecordingPreflight.freeSpace() else { return }
+        let left: TimeInterval? = free < RecordingPreflight.lowSpaceWhileRecording
+            ? RecordingPreflight.recordingTimeLeft(freeBytes: free) : nil
+        if recordingSpaceLeft != left { recordingSpaceLeft = left }
+        if let left, !lowSpaceNotified {
+            lowSpaceNotified = true
+            notifyUser(title: "Sekitiri — disk space is running low",
+                       body: "This Mac has room for \(RecordingPreflight.describe(left)) more of recording. Free up space so the meeting keeps recording.")
+        }
+    }
+
+    /// What the quit confirmation says about the recording in progress.
+    var quitWhileRecordingMessage: String {
+        let title = recordingTitle.isEmpty ? "This recording" : "“\(recordingTitle)” (\(elapsed) so far)"
+        return "\(title) is saved first. Its transcript finishes the next time you open Sekitiri."
+    }
+
+    func openRecoveredMeeting() {
+        if let first = recoveredRecordings.first { requestedMeetingID = first.id }
+        recoveredRecordings = []
     }
 
     private func protectRecordingFromThermalPressureIfNeeded() {
@@ -1004,7 +1044,13 @@ final class AppModel: ObservableObject {
         case .idle: systemAudioTrack = .off
         case .recording: systemAudioTrack = .recording
         case .paused: systemAudioTrack = .paused
-        case .unavailable(let message): systemAudioTrack = .degraded(message)
+        case .unavailable(let message):
+            systemAudioTrack = .degraded(message)
+            // A tap macOS refuses to create usually means permission was
+            // withdrawn: ask for a fresh check before the next recording.
+            if message.contains("process tap creation failed") {
+                RecordingPreflight.setComputerAudioConfirmed(false)
+            }
         }
     }
 
@@ -1292,6 +1338,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controlServer: RecordingControlServer?
     private var globalStopMonitor: Any?
     private var localStopMonitor: Any?
+    private var stopShortcutTrusted = RecordingPreflight.stopShortcutWorksEverywhere
+    private var activationObserver: NSObjectProtocol?
     private var miniRecorder: MiniRecorderController?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -1299,6 +1347,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // leave the menu-bar process alive so reminders and browser checks
         // continue without requiring a second helper app.
         false
+    }
+
+    nonisolated private static func isStopShortcut(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return event.keyCode == 15 && flags.contains([.command, .option])
+    }
+
+    private func makeGlobalStopMonitor() -> Any? {
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard Self.isStopShortcut(event) else { return }
+            Task { @MainActor [weak self] in self?.model.stop() }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -1311,7 +1371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Stop recording and quit?"
-        alert.informativeText = "Sekitiri will stop and save this recording first. Transcription continues the next time you open Sekitiri."
+        alert.informativeText = model.quitWhileRecordingMessage
         alert.addButton(withTitle: "Stop and Quit")
         alert.addButton(withTitle: "Keep Recording")
         NSApp.activate()
@@ -1339,17 +1399,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // ⌥⌘R is a native emergency stop. It never starts recording and does
         // not inspect keystrokes other than this exact registered combination.
-        let handleStopShortcut: (NSEvent) -> Void = { [weak self] event in
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard event.keyCode == 15, flags.contains([.command, .option]) else { return }
+        globalStopMonitor = makeGlobalStopMonitor()
+        localStopMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard Self.isStopShortcut(event) else { return event }
             Task { @MainActor [weak self] in self?.model.stop() }
-        }
-        globalStopMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handleStopShortcut)
-        localStopMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard event.keyCode == 15, flags.contains([.command, .option]) else { return event }
-            handleStopShortcut(event)
             return nil
+        }
+        // Accessibility access granted while Sekitiri is open only reaches
+        // monitors made afterwards, so make the global one again then.
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let trusted = RecordingPreflight.stopShortcutWorksEverywhere
+                defer { self.stopShortcutTrusted = trusted }
+                guard trusted, !self.stopShortcutTrusted else { return }
+                if let monitor = self.globalStopMonitor { NSEvent.removeMonitor(monitor) }
+                self.globalStopMonitor = self.makeGlobalStopMonitor()
+            }
         }
 
         miniRecorder = MiniRecorderController(model: model)

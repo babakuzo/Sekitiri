@@ -97,6 +97,22 @@ struct ContentView: View {
         } message: {
             Text(model.detectedCallPrompt.map { "\($0.title) is open. Start recording? Make sure everyone has consented." } ?? "A meeting call is open.")
         }
+        .alert(
+            model.recoveredRecordings.count > 1
+                ? "We recovered \(model.recoveredRecordings.count) recordings"
+                : "We recovered your recording",
+            isPresented: Binding(
+                get: { !model.recoveredRecordings.isEmpty && hasCompletedOnboarding },
+                set: { if !$0 { model.recoveredRecordings = [] } }
+            )
+        ) {
+            Button("OK", role: .cancel) { model.recoveredRecordings = [] }
+            Button(model.recoveredRecordings.count > 1 ? "Show the First" : "Open Meeting") {
+                model.openRecoveredMeeting()
+            }
+        } message: {
+            Text(RecoveredRecording.message(for: model.recoveredRecordings))
+        }
         .alert(item: $model.recordingSafetyPrompt) { prompt in
             Alert(
                 title: Text(prompt.reason),
